@@ -148,6 +148,42 @@ mask, with transparency effects. pikepdf can only extract the images
 themselves, not rasterize them exactly as they would appear in a PDF viewer. In
 the vast majority of cases, however, the image can be extracted as it appears.
 
+## Limiting image size (decompression bombs)
+
+A hostile PDF can declare an image with enormous `/Width` and `/Height` while
+storing almost no actual image data, so that decoding it would allocate a huge
+amount of memory -- a *decompression bomb* denial-of-service. To guard against
+this, image decoding (`as_pil_image`, `extract_to`, and the Jupyter preview)
+enforces a limit on the number of pixels in a single image, analogous to
+Pillow's `PIL.Image.MAX_IMAGE_PIXELS`.
+
+```{eval-rst}
+.. py:attribute:: pikepdf.PdfImage.MAX_IMAGE_PIXELS
+
+   The maximum number of pixels (``width * height``) pikepdf will decode from a
+   single image. An image larger than twice this value raises
+   :py:exc:`pikepdf.DecompressionBombError`; an image larger than this value
+   emits :py:exc:`pikepdf.DecompressionBombWarning`. Set to ``None`` to disable
+   the check.
+
+   Until it is assigned, it defaults to
+   ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- Pillow's default is often
+   too low for legitimate high-DPI scanned PDFs (large blueprints, maps, etc.).
+   Once assigned, the value is independent of Pillow's setting. It is a global
+   setting shared by all image objects.
+```
+
+```python
+# Allow larger images for a batch of trusted, high-resolution scans
+pikepdf.PdfImage.MAX_IMAGE_PIXELS = 2_000_000_000
+
+# Or disable the check entirely (not recommended for untrusted input)
+pikepdf.PdfImage.MAX_IMAGE_PIXELS = None
+```
+
+Because pikepdf's exception types subclass Pillow's, code that already handles
+`PIL.Image.DecompressionBombError` will catch pikepdf's too.
+
 ## Stored bytes are not the presentation image
 
 The raw bytes stored in an image stream are not, on their own, the picture a

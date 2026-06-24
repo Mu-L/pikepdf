@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import threading
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from decimal import Decimal
 from io import BytesIO
 from itertools import zip_longest
@@ -32,6 +34,11 @@ from pikepdf.objects import (
 if TYPE_CHECKING:
     from PIL import Image
     from PIL.ImageCms import ImageCmsProfile
+
+    # Created lazily at runtime by _decompression_bomb_classes()/__getattr__ to
+    # keep Pillow out of ``import pikepdf``; declared here for static analysis.
+    DecompressionBombError = Image.DecompressionBombError
+    DecompressionBombWarning = Image.DecompressionBombWarning
 
 
 T = TypeVar('T')
@@ -115,7 +122,111 @@ class PaletteData(NamedTuple):
     palette: bytes
 
 
-class PdfImageBase(ABC):
+# Decompression-bomb protection (issue #733). pikepdf mirrors Pillow's
+# MAX_IMAGE_PIXELS mechanism, but with its own limit (PDFs routinely hold
+# high-DPI scans that exceed Pillow's default) and its own exception types
+# (which subclass Pillow's, so existing handlers keep working).
+_UNSET = object()
+_max_image_pixels: object | int | None = _UNSET
+_PIKEPDF_PIXEL_FLOOR = 500_000_000
+
+# Built lazily so that ``import pikepdf`` does not import Pillow (see
+# tests/test_lazy_load.py).
+_bomb_classes: dict[str, type] = {}
+_pil_limit_lock = threading.Lock()
+
+
+def _decompression_bomb_classes() -> tuple[type, type]:
+    """Return pikepdf's (DecompressionBombError, DecompressionBombWarning).
+
+    These subclass Pillow's equivalents and are constructed on first use, so
+    that merely importing pikepdf does not import Pillow.
+    """
+    if not _bomb_classes:
+        from PIL import Image
+
+        _bomb_classes['error'] = type(
+            'DecompressionBombError',
+            (Image.DecompressionBombError,),
+            {
+                '__module__': __name__,
+                '__doc__': "Image has more pixels than "
+                ":attr:`pikepdf.PdfImage.MAX_IMAGE_PIXELS` allows.",
+            },
+        )
+        _bomb_classes['warning'] = type(
+            'DecompressionBombWarning',
+            (Image.DecompressionBombWarning,),
+            {
+                '__module__': __name__,
+                '__doc__': "Image has more pixels than "
+                ":attr:`pikepdf.PdfImage.MAX_IMAGE_PIXELS` allows.",
+            },
+        )
+    return _bomb_classes['error'], _bomb_classes['warning']
+
+
+def __getattr__(name: str):
+    """Lazily expose the Pillow-derived exception classes as module attributes."""
+    if name in ('DecompressionBombError', 'DecompressionBombWarning'):
+        error, warning = _decompression_bomb_classes()
+        return error if name.endswith('Error') else warning
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+@contextmanager
+def _pillow_pixel_limit(limit: int | None):
+    """Temporarily set Pillow's global ``MAX_IMAGE_PIXELS`` for a decode.
+
+    Used to make pikepdf's limit (not Pillow's default) govern the
+    Pillow-decoded direct-extraction path. The lock spans only the brief window
+    in which Pillow checks the image size (at ``Image.open``, before any pixels
+    are decoded), so it does not serialize actual decoding.
+    """
+    from PIL import Image
+
+    with _pil_limit_lock:
+        saved = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = limit
+        try:
+            yield
+        finally:
+            Image.MAX_IMAGE_PIXELS = saved
+
+
+class _PdfImageMeta(ABCMeta):
+    """Metaclass providing the class-level ``MAX_IMAGE_PIXELS`` property."""
+
+    @property
+    def MAX_IMAGE_PIXELS(cls) -> int | None:
+        """Maximum number of pixels pikepdf will decode from a single image.
+
+        Analogous to :data:`PIL.Image.MAX_IMAGE_PIXELS`. Images larger than
+        twice this value raise :class:`pikepdf.DecompressionBombError`; images
+        larger than this value emit :class:`pikepdf.DecompressionBombWarning`.
+        Set to ``None`` to disable the check entirely.
+
+        Until it is assigned, this defaults to
+        ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- Pillow's default is
+        often too low for high-DPI scanned PDFs. Once assigned, the value is
+        independent of Pillow's setting.
+        """
+        if _max_image_pixels is _UNSET:
+            from PIL import Image
+
+            pil = Image.MAX_IMAGE_PIXELS
+            if pil is None:
+                return _PIKEPDF_PIXEL_FLOOR
+            return max(_PIKEPDF_PIXEL_FLOOR, pil)
+        return cast('int | None', _max_image_pixels)
+
+    @MAX_IMAGE_PIXELS.setter
+    def MAX_IMAGE_PIXELS(cls, value: int | None) -> None:
+        global _max_image_pixels
+        _max_image_pixels = value
+
+
+class PdfImageBase(ABC, metaclass=_PdfImageMeta):
     """Abstract base class for images."""
 
     SIMPLE_COLORSPACES = {'/DeviceRGB', '/DeviceGray', '/CalRGB', '/CalGray'}
@@ -353,6 +464,30 @@ class PdfImageBase(ABC):
             raise NotImplementedError(f"not sure how to interpret this palette: {base}")
         return PaletteData(base, lookup)
 
+    def _check_pixels(self, width: int, height: int) -> None:
+        """Guard against decompression-bomb images (issue #733).
+
+        Mirrors :func:`PIL.Image._decompression_bomb_check`, but uses pikepdf's
+        :attr:`MAX_IMAGE_PIXELS` and raises pikepdf's exception types.
+        """
+        limit = type(self).MAX_IMAGE_PIXELS
+        if limit is None:
+            return
+        pixels = max(1, width) * max(1, height)
+        error, warning = _decompression_bomb_classes()
+        if pixels > 2 * limit:
+            raise error(
+                f"Image size ({pixels} pixels) exceeds limit of "
+                f"{2 * limit} pixels; possible decompression bomb."
+            )
+        if pixels > limit:
+            warnings.warn(
+                f"Image size ({pixels} pixels) exceeds limit of "
+                f"{limit} pixels; possible decompression bomb.",
+                warning,
+                stacklevel=3,
+            )
+
     @abstractmethod
     def as_pil_image(self, apply_decode_array: bool = True) -> Image.Image:
         """Convert this PDF image to a Python PIL (Pillow) image."""
@@ -462,6 +597,7 @@ class PdfImage(PdfImageBase):
             iccbytesio = BytesIO(iccbuffer)
             try:
                 from PIL.ImageCms import ImageCmsProfile
+
                 self._icc = ImageCmsProfile(iccbytesio)
             except OSError as e:
                 if str(e) == 'cannot open profile from string':
@@ -701,6 +837,7 @@ class PdfImage(PdfImageBase):
 
     def _extract_transcoded(self) -> Image.Image:
         from PIL import Image
+
         if self.image_mask:
             return self._extract_transcoded_mask()
 
@@ -868,8 +1005,18 @@ class PdfImage(PdfImageBase):
         direct_extraction = self._extract_direct(stream=bio, apply_decode_array=False)
         if direct_extraction:
             bio.seek(0)
-            im = Image.open(bio)
+            # Let Pillow decode, but make pikepdf's limit (not Pillow's default)
+            # govern. Pillow checks the size inside Image.open before decoding
+            # any pixels; we suppress its own gate and apply our equivalent check
+            # against the real decoded dimensions, raising pikepdf's types.
+            with _pillow_pixel_limit(None):
+                im = Image.open(bio)
+            self._check_pixels(im.width, im.height)
         else:
+            # The transcoding path allocates buffers sized from the declared
+            # /Width and /Height before reading the stream, so check those
+            # dimensions before extracting.
+            self._check_pixels(self.width, self.height)
             im = self._extract_transcoded()
             if not im:
                 raise UnsupportedImageTypeError(repr(self))
@@ -1215,6 +1362,8 @@ class PdfInlineImage(PdfImageBase):
 __all__ = [
     'CMYKDecodeArray',
     'DecodeArray',
+    'DecompressionBombError',
+    'DecompressionBombWarning',
     'HifiPrintImageNotTranscodableError',
     'ImageDecompressionError',
     'InvalidPdfImageError',

@@ -16,7 +16,27 @@ the architecture notes on thread safety.
 
 ## v10.9.2
 
+### Security
+
+-   Hardened image extraction against decompression-bomb (memory exhaustion)
+    attacks. A malicious PDF could declare an image with enormous ``/Width`` and
+    ``/Height`` so that {meth}`pikepdf.PdfImage.as_pil_image` attempted to
+    allocate many gigabytes before reading the (tiny) image stream. pikepdf now
+    enforces a configurable pixel limit, {attr}`pikepdf.PdfImage.MAX_IMAGE_PIXELS`
+    (analogous to ``PIL.Image.MAX_IMAGE_PIXELS``), across every image-decode
+    path -- including the 2/4-bit transcoding path, 1-bit and 8-bit images, and
+    the Pillow-decoded JPEG/JPEG2000/CCITT path. Oversized images raise
+    {exc}`pikepdf.DecompressionBombError` and borderline images emit
+    {exc}`pikepdf.DecompressionBombWarning` (both subclass Pillow's equivalents).
+    (#733)
+
 ### New features
+
+-   Added {attr}`pikepdf.PdfImage.MAX_IMAGE_PIXELS`, a settable class-level limit
+    on the number of pixels pikepdf will decode from a single image. Until set,
+    it defaults to ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- a floor
+    suited to high-DPI scanned PDFs -- and tracks Pillow's setting; once assigned
+    it becomes independent of Pillow. Set it to ``None`` to disable the check.
 
 -   {class}`pikepdf.Array` now implements the standard Python ``list`` interface:
     slicing (including ``del`` on slices and slice assignment), and the

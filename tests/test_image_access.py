@@ -589,9 +589,9 @@ def test_image_palette2(spec, tmp_path_factory):
                 note("pdfimages bug - 1bit image stripped of palette")
                 return
 
-        assert (
-            not diff.getbbox()
-        ), f"{diff.getpixel((0, 0))}, {im1.getpixel((0,0))}, {im2.getpixel((0,0))}"
+        assert not diff.getbbox(), (
+            f"{diff.getpixel((0, 0))}, {im1.getpixel((0, 0))}, {im2.getpixel((0, 0))}"
+        )
 
 
 def test_bool_in_inline_image():
@@ -963,7 +963,9 @@ def test_decode_array_identity_no_inversion(bpc, decode):
         width = 2
         expected = [255, 0]
     pim = PdfImage(
-        _make_gray_xobject(pdf, width=width, height=1, bpc=bpc, data=data, decode=decode)
+        _make_gray_xobject(
+            pdf, width=width, height=1, bpc=bpc, data=data, decode=decode
+        )
     )
     assert list(pim.as_pil_image().convert('L').tobytes())[:2] == expected
 
@@ -1101,9 +1103,7 @@ GRAY_RGB_PALETTE = b''.join(bytes([gray, gray, gray]) for gray in range(256))
         (lambda: Name.DeviceCMYK, 4, 8, CMYK_PALETTE, 'CMYK', 'P'),
         (lambda: Name.DeviceGray, 4, 4, b'\x04\x08\x02\x0f', 'L', 'P'),
         (
-            lambda: Array(
-                [Name.CalRGB, Dictionary(WhitePoint=Array([1.0, 1.0, 1.0]))]
-            ),
+            lambda: Array([Name.CalRGB, Dictionary(WhitePoint=Array([1.0, 1.0, 1.0]))]),
             255,
             8,
             GRAY_RGB_PALETTE,
@@ -1487,3 +1487,145 @@ def test_repr_when_mode_not_impl():
     assert repr(pim).startswith('<pikepdf.PdfImage image mode=? size=1x1')
     with pytest.raises(NotImplementedError):
         pim.mode
+
+
+# --- Decompression bomb protection (issue #733) ---------------------------
+
+
+@pytest.fixture
+def restore_pixel_limits():
+    """Save/restore both pikepdf's and Pillow's pixel limits around a test."""
+    import pikepdf.models.image as imgmod
+
+    saved_pikepdf = imgmod._max_image_pixels
+    saved_pil = Image.MAX_IMAGE_PIXELS
+    try:
+        yield imgmod
+    finally:
+        imgmod._max_image_pixels = saved_pikepdf
+        Image.MAX_IMAGE_PIXELS = saved_pil
+
+
+def _image_stream(pdf, *, bpc, colorspace, width, height, imbytes):
+    return Stream(
+        pdf,
+        imbytes,
+        BitsPerComponent=bpc,
+        ColorSpace=colorspace,
+        Width=width,
+        Height=height,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+
+
+def test_max_image_pixels_defaults_to_floor(restore_pixel_limits):
+    imgmod = restore_pixel_limits
+    imgmod._max_image_pixels = imgmod._UNSET  # simulate never-set
+    assert PdfImage.MAX_IMAGE_PIXELS == max(500_000_000, Image.MAX_IMAGE_PIXELS)
+
+
+def test_max_image_pixels_decouples_from_pil(restore_pixel_limits):
+    PdfImage.MAX_IMAGE_PIXELS = 123
+    assert PdfImage.MAX_IMAGE_PIXELS == 123
+    # Once set, pikepdf's limit is independent of Pillow's.
+    Image.MAX_IMAGE_PIXELS = 4_000_000_000
+    assert PdfImage.MAX_IMAGE_PIXELS == 123
+
+
+def test_max_image_pixels_none_disables_check(restore_pixel_limits):
+    PdfImage.MAX_IMAGE_PIXELS = None
+    pdf = pikepdf.new()
+    img = PdfImage(
+        _image_stream(
+            pdf,
+            bpc=4,
+            colorspace=Name.DeviceGray,
+            width=200000,
+            height=200000,
+            imbytes=b'\x00',
+        )
+    )
+    # Setting None disables the guard; check returns without raising (and without
+    # attempting the multi-gigabyte allocation).
+    assert img._check_pixels(200000, 200000) is None
+
+
+def test_decompression_bomb_exception_subclasses_pil():
+    assert issubclass(pikepdf.DecompressionBombError, Image.DecompressionBombError)
+    assert issubclass(pikepdf.DecompressionBombWarning, Image.DecompressionBombWarning)
+
+
+def test_issue_733_4bit_bomb_raises(restore_pixel_limits):
+    pdf = pikepdf.new()
+    img = PdfImage(
+        _image_stream(
+            pdf,
+            bpc=4,
+            colorspace=Name.DeviceGray,
+            width=200000,
+            height=200000,
+            imbytes=b'\x00',
+        )
+    )
+    with pytest.raises(pikepdf.DecompressionBombError):
+        img.as_pil_image()
+
+
+def test_1bit_bomb_raises(restore_pixel_limits):
+    pdf = pikepdf.new()
+    img = PdfImage(
+        _image_stream(
+            pdf,
+            bpc=1,
+            colorspace=Name.DeviceGray,
+            width=200000,
+            height=200000,
+            imbytes=b'\x00',
+        )
+    )
+    with pytest.raises(pikepdf.DecompressionBombError):
+        img.as_pil_image()
+
+
+def test_8bit_rgb_bomb_raises(restore_pixel_limits):
+    pdf = pikepdf.new()
+    img = PdfImage(
+        _image_stream(
+            pdf,
+            bpc=8,
+            colorspace=Name.DeviceRGB,
+            width=200000,
+            height=200000,
+            imbytes=b'\x00\x00\x00',
+        )
+    )
+    with pytest.raises(pikepdf.DecompressionBombError):
+        img.as_pil_image()
+
+
+def test_warning_band_warns_not_raises(restore_pixel_limits):
+    PdfImage.MAX_IMAGE_PIXELS = 2  # 2x2 image = 4 px: > limit, <= 2*limit
+    pdf = pikepdf.new()
+    img = PdfImage(
+        _image_stream(
+            pdf,
+            bpc=8,
+            colorspace=Name.DeviceGray,
+            width=2,
+            height=2,
+            imbytes=b'\x00\x01\x02\x03',
+        )
+    )
+    with pytest.warns(pikepdf.DecompressionBombWarning):
+        im = img.as_pil_image()
+    assert im.size == (2, 2)
+
+
+def test_direct_path_honors_pikepdf_limit(congress, restore_pixel_limits):
+    # congress.pdf is a DCTDecode (JPEG) image extracted via the direct path,
+    # which Pillow decodes. A very low pikepdf limit must govern that path too.
+    PdfImage.MAX_IMAGE_PIXELS = 10
+    xobj, _ = congress
+    with pytest.raises(pikepdf.DecompressionBombError):
+        PdfImage(xobj).as_pil_image()
