@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, TypeVar, cast
 from pikepdf import jbig2
 from pikepdf._core import Buffer, Pdf, PdfError, StreamDecodeLevel
 from pikepdf._exceptions import DependencyError
-from pikepdf.models import _transcoding
+from pikepdf.models import _cal_icc, _transcoding
 from pikepdf.models._transcoding import ImageDecompressionError
 from pikepdf.objects import (
     Array,
@@ -230,7 +230,12 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
     """Abstract base class for images."""
 
     SIMPLE_COLORSPACES = {'/DeviceRGB', '/DeviceGray', '/CalRGB', '/CalGray'}
-    MAIN_COLORSPACES = SIMPLE_COLORSPACES | {'/DeviceCMYK', '/CalCMYK', '/ICCBased'}
+    MAIN_COLORSPACES = SIMPLE_COLORSPACES | {
+        '/DeviceCMYK',
+        '/CalCMYK',
+        '/ICCBased',
+        '/Lab',
+    }
     PRINT_COLORSPACES = {'/Separation', '/DeviceN'}
 
     @abstractmethod
@@ -278,8 +283,11 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
             return (0.0, 1.0)
         if self.colorspace in ('/DeviceRGB', '/CalRGB'):
             return (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
-        if self.colorspace == '/DeviceCMYK':
+        if self.colorspace in ('/DeviceCMYK', '/CalCMYK'):
             return (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+        if self.colorspace == '/Lab':
+            amin, amax, bmin, bmax = self._lab_range()
+            return (0.0, 100.0, amin, amax, bmin, bmax)
         if self.colorspace == '/ICCBased':
             if self._approx_mode_from_icc() == 'L':
                 return (0.0, 1.0)
@@ -296,6 +304,22 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
     def decode_parms(self):
         """List of the /DecodeParms, arguments to filters."""
         return self._metadata('DecodeParms', _ensure_list, [])
+
+    def _lab_range(self) -> tuple[float, float, float, float]:
+        """Return the /Lab colour space's (amin, amax, bmin, bmax) Range.
+
+        Defaults to (-100, 100, -100, 100) per ISO 32000-2 Table 64 when the
+        colour space does not specify a /Range.
+        """
+        try:
+            lab_dict = cast(Dictionary, self._colorspaces[1])
+            rng = lab_dict.get('/Range')
+            if rng is not None:
+                amin, amax, bmin, bmax = (float(v) for v in rng)
+                return amin, amax, bmin, bmax
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+        return (-100.0, 100.0, -100.0, 100.0)
 
     @property
     def colorspace(self) -> str | None:
@@ -314,6 +338,7 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
                     '/DeviceN',
                     '/CalGray',
                     '/CalRGB',
+                    '/Lab',
                 ):
                     return subspace[0]
             if self._colorspaces[0] == '/DeviceN':
@@ -395,14 +420,27 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
             m = 'Separation'
         elif self.indexed:
             m = 'P'
-        elif self.colorspace == '/DeviceGray' and self.bits_per_component == 1:
+        elif (
+            self.colorspace in ('/DeviceGray', '/CalGray')
+            and self.bits_per_component == 1
+        ):
             m = '1'
-        elif self.colorspace == '/DeviceGray' and self.bits_per_component > 1:
+        elif (
+            self.colorspace in ('/DeviceGray', '/CalGray')
+            and self.bits_per_component == 16
+        ):
+            m = 'I;16'
+        elif (
+            self.colorspace in ('/DeviceGray', '/CalGray')
+            and self.bits_per_component > 1
+        ):
             m = 'L'
-        elif self.colorspace == '/DeviceRGB':
+        elif self.colorspace in ('/DeviceRGB', '/CalRGB'):
             m = 'RGB'
-        elif self.colorspace == '/DeviceCMYK':
+        elif self.colorspace in ('/DeviceCMYK', '/CalCMYK'):
             m = 'CMYK'
+        elif self.colorspace == '/Lab':
+            m = 'LAB'
         elif self.colorspace == '/ICCBased':
             try:
                 m = self._approx_mode_from_icc()
@@ -489,7 +527,9 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
             )
 
     @abstractmethod
-    def as_pil_image(self, apply_decode_array: bool = True) -> Image.Image:
+    def as_pil_image(
+        self, apply_decode_array: bool = True, apply_mask: bool = True
+    ) -> Image.Image:
         """Convert this PDF image to a Python PIL (Pillow) image."""
 
     def _repr_png_(self) -> bytes:
@@ -607,6 +647,34 @@ class PdfImage(PdfImageBase):
                     ) from e
         return self._icc
 
+    def _synthesize_cal_icc(self) -> bytes | None:
+        """Build an ICC profile from CalRGB/CalGray parameters, if possible.
+
+        The Cal* parameters (WhitePoint, Gamma, Matrix) describe a calibrated
+        colour space. pikepdf decodes the samples as the device equivalent and
+        attaches this profile so the calibration is preserved for downstream
+        consumers. Returns None for non-Cal*, indexed, or malformed (no
+        WhitePoint) images.
+        """
+        if self.indexed or self.colorspace not in ('/CalRGB', '/CalGray'):
+            return None
+        try:
+            cal = cast(Dictionary, self._colorspaces[1])
+            white = cal.get('/WhitePoint')
+            if white is None:
+                return None
+            white_point = tuple(float(v) for v in white)
+            if len(white_point) != 3:
+                return None
+            if self.colorspace == '/CalGray':
+                gamma = float(cal.get('/Gamma', 1.0))
+                return _cal_icc.build_calgray_icc(white_point, gamma)
+            gamma_rgb = tuple(float(v) for v in cal.get('/Gamma', [1.0, 1.0, 1.0]))
+            matrix = [float(v) for v in cal.get('/Matrix', [1, 0, 0, 0, 1, 0, 0, 0, 1])]
+            return _cal_icc.build_calrgb_icc(white_point, gamma_rgb, matrix)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
     def _remove_simple_filters(self):
         """Remove simple lossless compression where it appears."""
         COMPLEX_FILTERS = {
@@ -717,7 +785,7 @@ class PdfImage(PdfImageBase):
         elif self.bits_per_component == 8:
             buffer = cast(memoryview, self.get_stream_buffer())
         else:
-            raise InvalidPdfImageError("BitsPerComponent must be 1, 2, 4, 8, or 16")
+            raise InvalidPdfImageError("BitsPerComponent must be 1, 2, 4, or 8")
 
         if self.mode == 'P' and self.palette is not None:
             base_mode, palette = self.palette
@@ -731,6 +799,72 @@ class PdfImage(PdfImageBase):
         else:
             im = _transcoding.image_from_byte_buffer(buffer, self.size, stride)
         return im
+
+    def _extract_transcoded_16bit(self) -> Image.Image:
+        """Extract a 16-bit-per-component image.
+
+        16-bit grayscale is produced losslessly as Pillow ``I;16``. Pillow has no
+        48/64-bit raw mode, so 16-bit RGB/CMYK are reduced to 8-bit (high byte)
+        with a warning.
+        """
+        from PIL import Image
+
+        if self.indexed:
+            raise UnsupportedImageTypeError("16-bit indexed images are not supported")
+        if self.mode == 'I;16':
+            return _transcoding.image_from_int16_buffer(self.read_bytes(), self.size)
+        if self.mode in ('RGB', 'CMYK'):
+            warnings.warn(
+                f"16-bit {self.mode} image reduced to 8-bit: Pillow has no "
+                "48/64-bit-per-pixel mode.",
+                UserWarning,
+                stacklevel=3,
+            )
+            data8 = _transcoding.downconvert_int16_to_8bit(self.read_bytes())
+            return Image.frombuffer(self.mode, self.size, data8, 'raw', self.mode, 0, 1)
+        raise UnsupportedImageTypeError(repr(self) + ", " + repr(self.obj))
+
+    def _extract_transcoded_lab(self) -> Image.Image:
+        """Extract a /Lab image as a Pillow ``LAB`` image.
+
+        PDF Lab samples decode (via the /Decode array) to physical L in [0, 100]
+        and a*/b* in the colour space's /Range. Pillow's ``LAB`` mode instead
+        stores L as 0..255 and a*/b* as 0..255 (with 128 representing zero), so
+        each band is remapped with a lookup table. The /Decode remap is therefore
+        baked in here and skipped by ``_apply_decode_array``.
+        """
+        from PIL import Image
+
+        if self.bits_per_component == 16:
+            raw = _transcoding.downconvert_int16_to_8bit(self.read_bytes())
+        elif self.bits_per_component == 8:
+            raw = self.read_bytes()
+        else:
+            raise UnsupportedImageTypeError(
+                "Lab images must be 8 or 16 bits per component"
+            )
+
+        decode = cast(RGBDecodeArray, self._decode_array)
+
+        def lut(dmin: float, dmax: float, *, lightness: bool) -> list[int]:
+            out = []
+            for s in range(256):
+                phys = dmin + (s / 255.0) * (dmax - dmin)
+                val = phys / 100.0 * 255.0 if lightness else phys + 128.0
+                out.append(int(round(min(255.0, max(0.0, val)))))
+            return out
+
+        # Interpret the interleaved L,a,b bytes as a 3-band image and split.
+        src = Image.frombuffer('RGB', self.size, raw, 'raw', 'RGB', 0, 1)
+        l_band, a_band, b_band = src.split()
+        return Image.merge(
+            'LAB',
+            (
+                l_band.point(lut(decode[0], decode[1], lightness=True)),
+                a_band.point(lut(decode[2], decode[3], lightness=False)),
+                b_band.point(lut(decode[4], decode[5], lightness=False)),
+            ),
+        )
 
     def _extract_transcoded_1bit(self) -> Image.Image:
         from PIL import Image
@@ -790,6 +924,10 @@ class PdfImage(PdfImageBase):
         if any(filt in ('/DCTDecode', '/JPXDecode') for filt in self.filters):
             return im
 
+        # /Lab images bake their /Decode remap into the LAB transcode.
+        if self.colorspace == '/Lab':
+            return im
+
         if self.indexed:
             maxval = float((1 << self.bits_per_component) - 1)
             if tuple(float(v) for v in raw_decode) != (0.0, maxval):
@@ -810,6 +948,23 @@ class PdfImage(PdfImageBase):
 
         # Identity map: nothing to do.
         if all(decode[2 * i : 2 * i + 2] == (0.0, 1.0) for i in range(nbands)):
+            return im
+
+        # 16-bit grayscale cannot use the 8-bit lookup table below. Honour the
+        # only common non-identity map, the reversal [1, 0] (via a 32-bit
+        # intermediate, since Pillow cannot point() an I;16 image); warn and skip
+        # any arbitrary map.
+        if im.mode == 'I;16':
+            if decode == (1.0, 0.0):
+                out = im.convert('I').point(lambda p: 65535 - p).convert('I;16')
+                out.info.update(im.info)
+                return out
+            warnings.warn(
+                "A non-trivial /Decode array on a 16-bit grayscale image is not "
+                "applied.",
+                UserWarning,
+                stacklevel=2,
+            )
             return im
 
         # Bilevel images can only represent two values, so the sole meaningful
@@ -844,7 +999,11 @@ class PdfImage(PdfImageBase):
         if self.mode in {'DeviceN', 'Separation'}:
             raise HifiPrintImageNotTranscodableError()
 
-        if self.mode == 'RGB' and self.bits_per_component == 8:
+        if self.colorspace == '/Lab' and not self.indexed:
+            im = self._extract_transcoded_lab()
+        elif self.bits_per_component == 16:
+            im = self._extract_transcoded_16bit()
+        elif self.mode == 'RGB' and self.bits_per_component == 8:
             # Cannot use the zero-copy .get_stream_buffer here, we have 3-byte
             # RGB and Pillow needs RGBX.
             im = Image.frombuffer(
@@ -866,11 +1025,25 @@ class PdfImage(PdfImageBase):
         # not here, so that it is applied exactly once across all code paths.
         if self.colorspace == '/ICCBased' and self.icc is not None:
             im.info['icc_profile'] = self.icc.tobytes()
+        else:
+            cal_icc = self._synthesize_cal_icc()
+            if cal_icc is not None:
+                im.info['icc_profile'] = cal_icc
 
         return im
 
+    def _has_alpha_mask(self) -> bool:
+        """Return True if a /SMask or /Mask would contribute an alpha channel."""
+        return isinstance(self.obj.get('/SMask'), Stream) or (
+            self.obj.get('/Mask') is not None
+        )
+
     def _extract_to_stream(
-        self, *, stream: BinaryIO, apply_decode_array: bool = True
+        self,
+        *,
+        stream: BinaryIO,
+        apply_decode_array: bool = True,
+        apply_mask: bool = True,
     ) -> str:
         """Extract the image to a stream.
 
@@ -883,20 +1056,27 @@ class PdfImage(PdfImageBase):
             stream: Writable stream to write data to
             apply_decode_array: Whether the extracted image should reflect the
                 image's /Decode array.
+            apply_mask: Whether an attached soft/explicit mask should be applied
+                as an alpha channel.
 
         Returns:
             The file format extension.
         """
-        direct_extraction = self._extract_direct(
-            stream=stream, apply_decode_array=apply_decode_array
-        )
-        if direct_extraction:
-            return direct_extraction
+        # A direct copy of the compressed stream cannot carry an alpha channel,
+        # so skip it when a mask must be composited.
+        if not (apply_mask and self._has_alpha_mask()):
+            direct_extraction = self._extract_direct(
+                stream=stream, apply_decode_array=apply_decode_array
+            )
+            if direct_extraction:
+                return direct_extraction
 
         im = None
         try:
-            im = self.as_pil_image(apply_decode_array=apply_decode_array)
-            if im.mode == 'CMYK':
+            im = self.as_pil_image(
+                apply_decode_array=apply_decode_array, apply_mask=apply_mask
+            )
+            if im.mode in ('CMYK', 'LAB'):
                 im.save(stream, format='tiff', compression='tiff_adobe_deflate')
                 return '.tiff'
             if im:
@@ -918,6 +1098,7 @@ class PdfImage(PdfImageBase):
         stream: BinaryIO | None = None,
         fileprefix: str = '',
         apply_decode_array: bool = True,
+        apply_mask: bool = True,
     ) -> str:
         """Extract the image directly to a usable image file.
 
@@ -951,6 +1132,10 @@ class PdfImage(PdfImageBase):
                 rather than the original .jpg/.jp2. Set to False to copy the
                 stored image data with the least processing (the raw, possibly
                 inverted, samples), e.g. for forensic use.
+            apply_mask: If True (default), an attached soft/explicit mask is
+                composited into an alpha channel, forcing a transparency-capable
+                format (.png) instead of a direct .jpg/.jp2 copy. Set to False to
+                extract the opaque base image only.
 
         Returns:
             If *fileprefix* was provided, then the fileprefix with the
@@ -961,12 +1146,14 @@ class PdfImage(PdfImageBase):
             raise ValueError("Cannot set both stream and fileprefix")
         if stream:
             return self._extract_to_stream(
-                stream=stream, apply_decode_array=apply_decode_array
+                stream=stream,
+                apply_decode_array=apply_decode_array,
+                apply_mask=apply_mask,
             )
 
         bio = BytesIO()
         extension = self._extract_to_stream(
-            stream=bio, apply_decode_array=apply_decode_array
+            stream=bio, apply_decode_array=apply_decode_array, apply_mask=apply_mask
         )
         bio.seek(0)
         filepath = Path(str(Path(fileprefix)) + extension)
@@ -986,7 +1173,9 @@ class PdfImage(PdfImageBase):
         """Access this image with the buffer protocol."""
         return self.obj.get_stream_buffer(decode_level=decode_level)
 
-    def as_pil_image(self, apply_decode_array: bool = True) -> Image.Image:
+    def as_pil_image(
+        self, apply_decode_array: bool = True, apply_mask: bool = True
+    ) -> Image.Image:
         """Extract the image as a Pillow Image, using decompression as necessary.
 
         Args:
@@ -994,6 +1183,11 @@ class PdfImage(PdfImageBase):
                 applied so the result matches how a PDF viewer would render the
                 image. Set to False to obtain the raw sample values as stored,
                 e.g. for forensic inspection of the underlying image data.
+            apply_mask: If True (default), an attached soft mask (/SMask),
+                explicit mask or colour-key mask (/Mask) is composited into an
+                alpha channel, so an image with transparency is returned as
+                ``LA``/``RGBA``. Set to False to obtain the opaque base image
+                only. Images without a mask are unaffected.
 
         Caller must close the image.
         """
@@ -1024,7 +1218,107 @@ class PdfImage(PdfImageBase):
         if apply_decode_array:
             im = self._apply_decode_array(im)
 
+        if apply_mask:
+            im = self._apply_mask(im)
+
         return im
+
+    def _apply_mask(self, im: Image.Image) -> Image.Image:
+        """Composite an attached /SMask or /Mask into an alpha channel.
+
+        Returns *im* unchanged when no mask is present. Modes that cannot carry
+        an alpha channel (CMYK, LAB, I;16) are converted to RGBA with a warning.
+        """
+        alpha = self._build_alpha_band(im.size)
+        if alpha is None:
+            return im
+
+        info = dict(im.info)
+        if im.mode == 'L':
+            im.putalpha(alpha)
+        elif im.mode == 'RGB':
+            im.putalpha(alpha)
+        elif im.mode == 'P':
+            im = im.convert('RGB')
+            im.putalpha(alpha)
+        else:
+            warnings.warn(
+                f"A {im.mode} image carries a mask but that mode cannot hold an "
+                "alpha channel; converting to RGBA.",
+                UserWarning,
+                stacklevel=3,
+            )
+            im = im.convert('RGB')
+            im.putalpha(alpha)
+        im.info.update(info)
+        return im
+
+    def _build_alpha_band(self, base_size: tuple[int, int]) -> Image.Image | None:
+        """Build an ``L`` alpha band from /SMask or /Mask, resized to *base_size*.
+
+        Precedence: a soft mask (/SMask) wins over an explicit or colour-key
+        /Mask; combining both is not supported. /SMaskInData (JPEG 2000) is left
+        to the codec and handled when Pillow surfaces the alpha itself. Returns
+        None when no usable mask is present.
+        """
+        from PIL import ImageChops
+
+        smask = self.obj.get('/SMask')
+        if isinstance(smask, Stream):
+            if '/Matte' in smask:
+                warnings.warn(
+                    "/SMask has a /Matte entry (pre-multiplied alpha) which "
+                    "pikepdf does not undo; colours near edges may be off.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+            smask_pim = PdfImage(smask)
+            alpha = smask_pim.as_pil_image(apply_mask=False).convert('L')
+            if alpha.size != base_size:
+                alpha = alpha.resize(base_size)
+            return alpha
+
+        mask = self.obj.get('/Mask')
+        if isinstance(mask, Stream):
+            mask_pim = PdfImage(mask)
+            mask_im = mask_pim.as_pil_image(apply_mask=False).convert('L')
+            # A stencil mask paints where the decoded sample is 0 and masks out
+            # where it is 1, so alpha is the inverse of the mask's luminance.
+            alpha = ImageChops.invert(mask_im)
+            if alpha.size != base_size:
+                alpha = alpha.resize(base_size)
+            return alpha
+        if isinstance(mask, Array):
+            return self._colorkey_alpha(mask, base_size)
+
+        return None
+
+    def _colorkey_alpha(
+        self, mask: Array, base_size: tuple[int, int]
+    ) -> Image.Image | None:
+        """Build an alpha band from a colour-key /Mask range array (8-bit only)."""
+        if (
+            self.bits_per_component != 8
+            or self.indexed
+            or self.mode
+            not in (
+                'L',
+                'RGB',
+                'CMYK',
+            )
+        ):
+            warnings.warn(
+                "Colour-key /Mask is only supported for 8-bit L/RGB/CMYK images; "
+                "it was not applied.",
+                UserWarning,
+                stacklevel=4,
+            )
+            return None
+        nbands = {'L': 1, 'RGB': 3, 'CMYK': 4}[self.mode]
+        ranges = [int(v) for v in mask]
+        if len(ranges) != 2 * nbands:
+            return None
+        return _transcoding.colorkey_alpha(self.read_bytes(), base_size, nbands, ranges)
 
     def _generate_ccitt_header(
         self,
@@ -1118,7 +1412,7 @@ class PdfJpxImage(PdfImage):
         super().__init__(obj)
         # Intrinsic decoded image for colorspace/equality introspection; the
         # /Decode remap is a presentation concern and intentionally excluded.
-        self._jpxpil = self.as_pil_image(apply_decode_array=False)
+        self._jpxpil = self.as_pil_image(apply_decode_array=False, apply_mask=False)
 
     def __eq__(self, other):
         if not isinstance(other, PdfImageBase):
@@ -1324,10 +1618,12 @@ class PdfInlineImage(PdfImageBase):
         img._set_pdf_source(tmppdf)  # Hold tmppdf open while PdfImage exists
         return img
 
-    def as_pil_image(self, apply_decode_array: bool = True) -> Image.Image:
+    def as_pil_image(
+        self, apply_decode_array: bool = True, apply_mask: bool = True
+    ) -> Image.Image:
         """Return inline image as a Pillow Image."""
         return self._convert_to_pdfimage().as_pil_image(
-            apply_decode_array=apply_decode_array
+            apply_decode_array=apply_decode_array, apply_mask=apply_mask
         )
 
     def extract_to(
@@ -1336,6 +1632,7 @@ class PdfInlineImage(PdfImageBase):
         stream: BinaryIO | None = None,
         fileprefix: str = '',
         apply_decode_array: bool = True,
+        apply_mask: bool = True,
     ):
         """Extract the inline image directly to a usable image file.
 
@@ -1346,6 +1643,7 @@ class PdfInlineImage(PdfImageBase):
             stream=stream,
             fileprefix=fileprefix,
             apply_decode_array=apply_decode_array,
+            apply_mask=apply_mask,
         )
 
     def read_bytes(self):

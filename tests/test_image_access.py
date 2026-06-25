@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 import zlib
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from math import ceil
 from os import fspath
@@ -323,7 +323,7 @@ def valid_random_image_spec(
     return ImageSpec(bpc, width, height, colorspace, imbytes)
 
 
-@given(spec=valid_random_image_spec(bpcs=st.sampled_from([1, 2, 4, 8])))
+@given(spec=valid_random_image_spec(bpcs=st.sampled_from([1, 2, 4, 8, 16])))
 @settings(deadline=None)  # For PyPy
 def test_image_save_compare(tmp_path_factory, spec):
     pdf = pdf_from_image_spec(spec)
@@ -334,7 +334,11 @@ def test_image_save_compare(tmp_path_factory, spec):
     bpc = image.BitsPerComponent
     pixeldata = image.read_bytes()
 
-    assume((bpc < 8 and cs == '/DeviceGray') or (bpc == 8))
+    assume(
+        (bpc < 8 and cs == '/DeviceGray')
+        or (bpc == 8)
+        or (bpc == 16 and cs == '/DeviceGray')
+    )
 
     outdir = tmp_path_factory.mktemp('image_roundtrip')
     outfile = outdir / f'test{w}{h}{cs[1:]}{bpc}.pdf'
@@ -353,6 +357,8 @@ def test_image_save_compare(tmp_path_factory, spec):
             assert pim.mode == 'RGB'
         elif cs == '/DeviceGray' and bpc == 8:
             assert pim.mode == 'L'
+        elif cs == '/DeviceGray' and bpc == 16:
+            assert pim.mode == 'I;16'
         elif cs == '/DeviceCMYK':
             assert pim.mode == 'CMYK'
         elif bpc == 1:
@@ -758,8 +764,14 @@ def test_imagemagick_uses_rle_compression(first_image_in):
     xobj, _rle = first_image_in('rle.pdf')
 
     pim = PdfImage(xobj)
+    # rle.pdf carries an /SMask, so the extracted image now has an alpha channel.
     im = pim.as_pil_image()
-    assert im.getpixel((5, 5)) == (255, 128, 0)
+    assert im.mode == 'RGBA'
+    assert im.getpixel((5, 5)) == (255, 128, 0, 255)
+    # Without mask application the colour samples are unchanged and opaque RGB.
+    opaque = pim.as_pil_image(apply_mask=False)
+    assert opaque.mode == 'RGB'
+    assert opaque.getpixel((5, 5)) == (255, 128, 0)
 
 
 def _make_gray_xobject(pdf, *, width, height, bpc, data, decode=None):
@@ -1347,8 +1359,20 @@ def test_random_image(spec, tmp_path_factory):
     height = pim.height
     bpc = pim.bits_per_component
     imbytes = pim.read_bytes()
+    # 16-bit RGB/CMYK is losslessly impossible in Pillow, so pikepdf reduces it
+    # to 8-bit and warns; that warning is expected behavior, so trap it here.
+    expect_downconvert = bpc == 16 and colorspace in (
+        Name.DeviceRGB,
+        Name.DeviceCMYK,
+    )
+    warn_ctx = (
+        pytest.warns(UserWarning, match='reduced to 8-bit')
+        if expect_downconvert
+        else nullcontext()
+    )
     try:
-        result_extension = pim.extract_to(stream=bio)
+        with warn_ctx:
+            result_extension = pim.extract_to(stream=bio)
         assert result_extension in ('.png', '.tiff')
     except ValueError as e:
         if 'not enough image data' in str(e):
@@ -1379,6 +1403,11 @@ def test_random_image(spec, tmp_path_factory):
     im = Image.open(bio)
     assert im.mode == pim.mode
     assert im.size == pim.size
+
+    # pdfimages reduces 16-bit images to 8 bits, so a pixel-exact cross-check
+    # against it is not meaningful; pikepdf's own output was validated above.
+    if bpc == 16:
+        return
 
     outprefix = f'{width}x{height}x{im.mode}-'
     tmpdir = tmp_path_factory.mktemp(outprefix)
@@ -1629,3 +1658,507 @@ def test_direct_path_honors_pikepdf_limit(congress, restore_pixel_limits):
     xobj, _ = congress
     with pytest.raises(pikepdf.DecompressionBombError):
         PdfImage(xobj).as_pil_image()
+
+
+# --- Gap A: CalRGB / CalGray / CalCMYK colour spaces -----------------------
+
+# A near-sRGB calibrated RGB space (D65 white, sRGB primaries, gamma 2.2).
+D65_WHITEPOINT = [0.9505, 1.0, 1.089]
+SRGB_GAMMA = [2.2, 2.2, 2.2]
+# Matrix is column-major: [Xr Yr Zr  Xg Yg Zg  Xb Yb Zb]
+SRGB_MATRIX = [
+    0.4124, 0.2126, 0.0193,
+    0.3576, 0.7152, 0.1192,
+    0.1805, 0.0722, 0.9505,
+]  # fmt: skip
+
+
+def _cal_image(colorspace_array, bpc, width, height, imbytes):
+    pdf = pikepdf.new()
+    imobj = Stream(
+        pdf,
+        imbytes,
+        BitsPerComponent=bpc,
+        ColorSpace=colorspace_array,
+        Width=width,
+        Height=height,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)  # keep the owning Pdf alive
+    return pim
+
+
+def test_calgray_extract():
+    cal = Array([Name.CalGray, Dictionary(WhitePoint=D65_WHITEPOINT, Gamma=2.2)])
+    pim = _cal_image(cal, bpc=8, width=4, height=4, imbytes=bytes(range(16)))
+    assert pim.colorspace == '/CalGray'
+    assert pim.mode == 'L'
+    im = pim.as_pil_image()
+    assert im.mode == 'L'
+    assert im.size == (4, 4)
+
+
+def test_calgray_1bit_mode():
+    cal = Array([Name.CalGray, Dictionary(WhitePoint=D65_WHITEPOINT)])
+    pim = _cal_image(cal, bpc=1, width=8, height=2, imbytes=b'\xaa\x55')
+    assert pim.mode == '1'
+    assert pim.as_pil_image().mode == '1'
+
+
+def test_calrgb_extract():
+    cal = Array(
+        [
+            Name.CalRGB,
+            Dictionary(WhitePoint=D65_WHITEPOINT, Gamma=SRGB_GAMMA, Matrix=SRGB_MATRIX),
+        ]
+    )
+    pim = _cal_image(cal, bpc=8, width=2, height=2, imbytes=bytes(range(12)))
+    assert pim.colorspace == '/CalRGB'
+    assert pim.mode == 'RGB'
+    im = pim.as_pil_image()
+    assert im.mode == 'RGB'
+    assert im.size == (2, 2)
+
+
+def test_calcmyk_extract():
+    # CalCMYK is a deprecated alias for DeviceCMYK; no profile is synthesized.
+    cal = Array([Name.CalCMYK, Dictionary(WhitePoint=D65_WHITEPOINT)])
+    pim = _cal_image(cal, bpc=8, width=2, height=2, imbytes=bytes(range(16)))
+    assert pim.colorspace == '/CalCMYK'
+    assert pim.mode == 'CMYK'
+    im = pim.as_pil_image()
+    assert im.mode == 'CMYK'
+    assert 'icc_profile' not in im.info
+
+
+def test_calcmyk_default_decode_array():
+    cal = Array([Name.CalCMYK, Dictionary(WhitePoint=D65_WHITEPOINT)])
+    pim = _cal_image(cal, bpc=8, width=2, height=2, imbytes=bytes(range(16)))
+    assert pim._decode_array == (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+
+
+def test_calrgb_attaches_icc_profile():
+    cal = Array(
+        [
+            Name.CalRGB,
+            Dictionary(WhitePoint=D65_WHITEPOINT, Gamma=SRGB_GAMMA, Matrix=SRGB_MATRIX),
+        ]
+    )
+    pim = _cal_image(cal, bpc=8, width=2, height=2, imbytes=bytes(range(12)))
+    im = pim.as_pil_image()
+    assert 'icc_profile' in im.info
+    prof = ImageCms.ImageCmsProfile(BytesIO(im.info['icc_profile']))
+    assert prof.profile.xcolor_space.strip() == 'RGB'
+
+
+def test_calgray_attaches_icc_profile():
+    cal = Array([Name.CalGray, Dictionary(WhitePoint=D65_WHITEPOINT, Gamma=2.2)])
+    pim = _cal_image(cal, bpc=8, width=4, height=4, imbytes=bytes(range(16)))
+    im = pim.as_pil_image()
+    assert 'icc_profile' in im.info
+    prof = ImageCms.ImageCmsProfile(BytesIO(im.info['icc_profile']))
+    assert prof.profile.xcolor_space.strip() == 'GRAY'
+
+
+def test_calrgb_icc_roundtrip_to_srgb():
+    # Our CalRGB profile uses sRGB primaries / D65 white / gamma 2.2, so
+    # converting a neutral mid-gray through it to sRGB should stay near 128.
+    cal = Array(
+        [
+            Name.CalRGB,
+            Dictionary(WhitePoint=D65_WHITEPOINT, Gamma=SRGB_GAMMA, Matrix=SRGB_MATRIX),
+        ]
+    )
+    pim = _cal_image(cal, bpc=8, width=1, height=1, imbytes=bytes([128, 128, 128]))
+    im = pim.as_pil_image()
+    src = ImageCms.ImageCmsProfile(BytesIO(im.info['icc_profile']))
+    srgb = ImageCms.createProfile('sRGB')
+    converted = ImageCms.profileToProfile(im, src, srgb, outputMode='RGB')
+    r, g, b = converted.getpixel((0, 0))
+    assert abs(r - 128) <= 12
+    assert abs(g - 128) <= 12
+    assert abs(b - 128) <= 12
+
+
+def test_cal_missing_whitepoint_falls_back():
+    # Malformed CalRGB without the required WhitePoint: extraction still works
+    # as a plain device space, but no ICC profile is synthesized.
+    cal = Array([Name.CalRGB, Dictionary(Gamma=SRGB_GAMMA, Matrix=SRGB_MATRIX)])
+    pim = _cal_image(cal, bpc=8, width=2, height=2, imbytes=bytes(range(12)))
+    im = pim.as_pil_image()
+    assert im.mode == 'RGB'
+    assert 'icc_profile' not in im.info
+
+
+# --- Gap B: 16-bit BitsPerComponent ----------------------------------------
+
+
+def _bpc16_image(colorspace, width, height, imbytes, **kwargs):
+    pdf = pikepdf.new()
+    imobj = _image_stream(
+        pdf, bpc=16, colorspace=colorspace, width=width, height=height, imbytes=imbytes
+    )
+    for k, v in kwargs.items():
+        imobj[Name(f'/{k}')] = v
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    return pim
+
+
+def test_16bit_gray_extract():
+    # 2x2 big-endian 16-bit grayscale: 0, 256, 32768, 65535
+    imbytes = b'\x00\x00\x01\x00\x80\x00\xff\xff'
+    pim = _bpc16_image(Name.DeviceGray, 2, 2, imbytes)
+    assert pim.bits_per_component == 16
+    assert pim.mode == 'I;16'
+    im = pim.as_pil_image()
+    assert im.mode == 'I;16'
+    assert im.getpixel((0, 0)) == 0
+    assert im.getpixel((1, 0)) == 256
+    assert im.getpixel((0, 1)) == 32768
+    assert im.getpixel((1, 1)) == 65535
+
+
+def test_16bit_gray_png_roundtrip():
+    imbytes = b'\x00\x00\x01\x00\x80\x00\xff\xff'
+    pim = _bpc16_image(Name.DeviceGray, 2, 2, imbytes)
+    bio = BytesIO()
+    ext = pim.extract_to(stream=bio)
+    assert ext == '.png'
+    bio.seek(0)
+    im = Image.open(bio)
+    assert im.mode == 'I;16'
+    assert im.getpixel((1, 1)) == 65535
+
+
+def test_16bit_gray_decode_reversal():
+    imbytes = b'\x00\x00\x80\x00\xff\xff\x01\x00'
+    pim = _bpc16_image(Name.DeviceGray, 2, 2, imbytes, Decode=[1.0, 0.0])
+    im = pim.as_pil_image()
+    assert im.getpixel((0, 0)) == 65535
+    assert im.getpixel((1, 1)) == 65535 - 256
+
+
+def test_16bit_gray_decode_arbitrary_warns():
+    imbytes = b'\x00\x00\x80\x00\xff\xff\x01\x00'
+    pim = _bpc16_image(Name.DeviceGray, 2, 2, imbytes, Decode=[0.0, 0.5])
+    with pytest.warns(UserWarning, match='16-bit'):
+        im = pim.as_pil_image()
+    # arbitrary /Decode is not applied to 16-bit gray
+    assert im.getpixel((0, 1)) == 65535
+
+
+def test_16bit_rgb_downconvert_warns():
+    # 1x1 16-bit RGB: R=0x1234 G=0x5678 B=0x9abc -> high bytes 0x12,0x56,0x9a
+    imbytes = b'\x12\x34\x56\x78\x9a\xbc'
+    pim = _bpc16_image(Name.DeviceRGB, 1, 1, imbytes)
+    assert pim.mode == 'RGB'
+    with pytest.warns(UserWarning, match='16-bit'):
+        im = pim.as_pil_image()
+    assert im.mode == 'RGB'
+    assert im.getpixel((0, 0)) == (0x12, 0x56, 0x9A)
+
+
+def test_16bit_cmyk_downconvert():
+    imbytes = b'\x10\x00\x20\x00\x30\x00\x40\x00'
+    pim = _bpc16_image(Name.DeviceCMYK, 1, 1, imbytes)
+    assert pim.mode == 'CMYK'
+    with pytest.warns(UserWarning, match='16-bit'):
+        im = pim.as_pil_image()
+    assert im.mode == 'CMYK'
+    assert im.getpixel((0, 0)) == (0x10, 0x20, 0x30, 0x40)
+
+
+# --- Gap C: /Lab colour space ----------------------------------------------
+
+
+def _lab_image(width, height, imbytes, range_=None, bpc=8):
+    pdf = pikepdf.new()
+    d = Dictionary(WhitePoint=[0.9505, 1.0, 1.089])
+    if range_ is not None:
+        d[Name.Range] = range_
+    imobj = _image_stream(
+        pdf,
+        bpc=bpc,
+        colorspace=Array([Name.Lab, d]),
+        width=width,
+        height=height,
+        imbytes=imbytes,
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    return pim
+
+
+def test_lab_default_range_mode():
+    pim = _lab_image(1, 1, b'\x80\x80\x80')
+    assert pim.colorspace == '/Lab'
+    assert pim.mode == 'LAB'
+
+
+def test_lab_decode_array_default():
+    pim = _lab_image(1, 1, b'\x80\x80\x80')
+    assert pim._decode_array == (0.0, 100.0, -100.0, 100.0, -100.0, 100.0)
+
+
+def test_lab_decode_array_with_range():
+    pim = _lab_image(1, 1, b'\x80\x80\x80', range_=[-128, 127, -128, 127])
+    assert pim._decode_array == (0.0, 100.0, -128.0, 127.0, -128.0, 127.0)
+
+
+def test_lab_remap_zero_point():
+    # Sample (128, 128, 128) ~ L=50, a=0, b=0 -> Pillow LAB neutral ~ (128,128,128)
+    pim = _lab_image(1, 1, b'\x80\x80\x80')
+    im = pim.as_pil_image()
+    assert im.mode == 'LAB'
+    L, a, b = im.getpixel((0, 0))
+    assert abs(L - 128) <= 2
+    assert abs(a - 128) <= 2
+    assert abs(b - 128) <= 2
+
+
+def test_lab_extract_to_tiff():
+    pim = _lab_image(2, 2, b'\x80\x80\x80' * 4)
+    bio = BytesIO()
+    ext = pim.extract_to(stream=bio)
+    assert ext == '.tiff'
+
+
+def test_lab_indexed_rejected():
+    pdf = pikepdf.new()
+    lab = Array([Name.Lab, Dictionary(WhitePoint=[0.9505, 1.0, 1.089])])
+    imobj = Stream(
+        pdf,
+        bytes(range(16)),
+        BitsPerComponent=8,
+        ColorSpace=Array([Name.Indexed, lab, 15, bytes(range(48))]),
+        Width=4,
+        Height=4,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    pim = PdfImage(imobj)
+    with pytest.raises((NotImplementedError, UnsupportedImageTypeError)):
+        pim.extract_to(stream=BytesIO())
+
+
+# --- Gap D: SMask / Mask / colour-key transparency -------------------------
+
+
+def _image_with_smask(
+    base_cs,
+    base_bytes,
+    w,
+    h,
+    smask_bytes,
+    smw=None,
+    smh=None,
+    smask_decode=None,
+):
+    pdf = pikepdf.new()
+    smw = smw or w
+    smh = smh or h
+    smask = Stream(
+        pdf,
+        smask_bytes,
+        BitsPerComponent=8,
+        ColorSpace=Name.DeviceGray,
+        Width=smw,
+        Height=smh,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    if smask_decode is not None:
+        smask.Decode = smask_decode
+    imobj = Stream(
+        pdf,
+        base_bytes,
+        BitsPerComponent=8,
+        ColorSpace=base_cs,
+        Width=w,
+        Height=h,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+        SMask=smask,
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    return pim
+
+
+def test_smask_produces_rgba():
+    pim = _image_with_smask(
+        Name.DeviceRGB, b'\xff\x00\x00' * 4, 2, 2, b'\x00\x55\xaa\xff'
+    )
+    im = pim.as_pil_image()
+    assert im.mode == 'RGBA'
+    assert im.getpixel((0, 0)) == (255, 0, 0, 0)
+    assert im.getpixel((1, 0)) == (255, 0, 0, 0x55)
+    assert im.getpixel((0, 1)) == (255, 0, 0, 0xAA)
+    assert im.getpixel((1, 1)) == (255, 0, 0, 255)
+
+
+def test_smask_gray_produces_la():
+    pim = _image_with_smask(
+        Name.DeviceGray, b'\x10\x20\x30\x40', 2, 2, b'\x00\xff\x00\xff'
+    )
+    im = pim.as_pil_image()
+    assert im.mode == 'LA'
+    assert im.getpixel((0, 0)) == (0x10, 0)
+    assert im.getpixel((1, 0)) == (0x20, 255)
+
+
+def test_smask_resampled():
+    pim = _image_with_smask(
+        Name.DeviceRGB, b'\x7f\x7f\x7f' * 16, 4, 4, b'\x00\xff\xff\x00', smw=2, smh=2
+    )
+    im = pim.as_pil_image()
+    assert im.mode == 'RGBA'
+    assert im.size == (4, 4)
+    # Resampled alpha is not uniform.
+    alphas = {im.getpixel((x, y))[3] for x in range(4) for y in range(4)}
+    assert len(alphas) > 1
+
+
+def test_smask_honors_its_own_decode():
+    # SMask sample 0 with Decode [1 0] maps to alpha 255 (opaque).
+    pim = _image_with_smask(
+        Name.DeviceRGB, b'\x00\x00\xff', 1, 1, b'\x00', smask_decode=[1, 0]
+    )
+    im = pim.as_pil_image()
+    assert im.getpixel((0, 0)) == (0, 0, 255, 255)
+
+
+def test_apply_mask_false_returns_opaque():
+    pim = _image_with_smask(
+        Name.DeviceRGB, b'\xff\x00\x00' * 4, 2, 2, b'\x00\x55\xaa\xff'
+    )
+    im = pim.as_pil_image(apply_mask=False)
+    assert im.mode == 'RGB'
+
+
+def test_extract_to_alpha_is_png():
+    pim = _image_with_smask(
+        Name.DeviceRGB, b'\xff\x00\x00' * 4, 2, 2, b'\x00\x55\xaa\xff'
+    )
+    bio = BytesIO()
+    ext = pim.extract_to(stream=bio)
+    assert ext == '.png'
+    bio.seek(0)
+    assert Image.open(bio).mode == 'RGBA'
+
+
+def test_cmyk_with_smask_converts_rgba():
+    pim = _image_with_smask(
+        Name.DeviceCMYK, b'\x00\x00\x00\x00' * 4, 2, 2, b'\x00\x55\xaa\xff'
+    )
+    with pytest.warns(UserWarning, match='alpha'):
+        im = pim.as_pil_image()
+    assert im.mode == 'RGBA'
+    assert im.getpixel((0, 0))[3] == 0
+
+
+def _stencil_mask_pim(mask_byte, mask_decode=None):
+    pdf = pikepdf.new()
+    mask = Stream(
+        pdf,
+        mask_byte,
+        ImageMask=True,
+        BitsPerComponent=1,
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    if mask_decode is not None:
+        mask.Decode = mask_decode
+    imobj = Stream(
+        pdf,
+        b'\x00\x00\xff',
+        BitsPerComponent=8,
+        ColorSpace=Name.DeviceRGB,
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+        Mask=mask,
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    return pim
+
+
+def test_stencil_mask_polarity():
+    # Stencil sample 0 (default Decode) paints -> opaque.
+    opaque = _stencil_mask_pim(b'\x00').as_pil_image()
+    assert opaque.getpixel((0, 0)) == (0, 0, 255, 255)
+    # Stencil sample 1 masks out -> transparent.
+    transparent = _stencil_mask_pim(b'\x80').as_pil_image()
+    assert transparent.getpixel((0, 0))[3] == 0
+
+
+def test_colorkey_mask_8bit():
+    pdf = pikepdf.new()
+    # 2x2 RGB: red, green, blue, white
+    base = b'\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff'
+    imobj = Stream(
+        pdf,
+        base,
+        BitsPerComponent=8,
+        ColorSpace=Name.DeviceRGB,
+        Width=2,
+        Height=2,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+        Mask=Array([250, 255, 0, 0, 0, 0]),  # mask out pure-red pixels
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    im = pim.as_pil_image()
+    assert im.mode == 'RGBA'
+    assert im.getpixel((0, 0))[3] == 0  # red masked
+    assert im.getpixel((1, 0))[3] == 255  # green kept
+    assert im.getpixel((1, 1))[3] == 255  # white kept
+
+
+def test_both_smask_and_mask_smask_wins():
+    pdf = pikepdf.new()
+    smask = Stream(
+        pdf,
+        b'\x80',
+        BitsPerComponent=8,
+        ColorSpace=Name.DeviceGray,
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    mask = Stream(
+        pdf,
+        b'\x80',  # would be fully transparent if used
+        ImageMask=True,
+        BitsPerComponent=1,
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    imobj = Stream(
+        pdf,
+        b'\x00\x00\xff',
+        BitsPerComponent=8,
+        ColorSpace=Name.DeviceRGB,
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+        SMask=smask,
+        Mask=mask,
+    )
+    pim = PdfImage(imobj)
+    pim._set_pdf_source(pdf)
+    im = pim.as_pil_image()
+    # SMask (alpha 0x80) takes precedence over the explicit Mask.
+    assert im.getpixel((0, 0)) == (0, 0, 255, 0x80)
