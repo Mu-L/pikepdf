@@ -258,6 +258,77 @@ def test_inline_to_pil(inline):
     assert im.size == (8, 8) and im.mode == iimage.mode
 
 
+def _inline_named_cs_pdf(cs_definition, cs_name=b'/CustomRGB', *, define=True):
+    """One-page PDF with an inline image referencing a named colour space."""
+    pdf = Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    page = pdf.pages[0]
+    if define:
+        cs_obj = pdf.make_indirect(cs_definition)
+        page.Resources = Dictionary(ColorSpace=Dictionary(CustomRGB=cs_obj))
+    else:
+        page.Resources = Dictionary(ColorSpace=Dictionary())
+    # 4x4 RGB pixels (page size must be >= 3 PDF units for extraction); bytes
+    # chosen to avoid a spurious 'EI' inline-image delimiter.
+    data = bytes([10, 20, 30]) * 16
+    content = b'q\nBI /W 4 /H 4 /BPC 8 /CS ' + cs_name + b' ID\n' + data + b'\nEI\nQ\n'
+    page.Contents = pdf.make_stream(content)
+    return pdf
+
+
+def _first_inline_image(pdf):
+    for operands, _cmd in parse_content_stream(pdf.pages[0]):
+        if operands and isinstance(operands[0], PdfInlineImage):
+            return operands[0]
+    return None
+
+
+CALRGB_CS = [
+    Name.CalRGB,
+    {
+        '/WhitePoint': [0.9505, 1.0, 1.089],
+        '/Gamma': [2.2, 2.2, 2.2],
+        '/Matrix': [
+            0.4124,
+            0.2126,
+            0.0193,
+            0.3576,
+            0.7152,
+            0.1192,
+            0.1805,
+            0.0722,
+            0.9505,
+        ],
+    },
+]
+
+
+def test_inline_named_colorspace_resolves():
+    pdf = _inline_named_cs_pdf(Array(CALRGB_CS))
+    iimage = _first_inline_image(pdf)
+    assert iimage is not None
+    assert iimage.colorspace == '/CalRGB'
+    assert iimage.mode == 'RGB'
+
+
+def test_inline_named_colorspace_extracts():
+    pdf = _inline_named_cs_pdf(Array(CALRGB_CS))
+    iimage = _first_inline_image(pdf)
+    assert iimage is not None
+    im = iimage.as_pil_image()
+    assert im.mode == 'RGB'
+    assert im.size == (4, 4)
+
+
+def test_inline_unknown_named_colorspace_errors():
+    # The inline image names /CustomRGB but it is not defined in /Resources.
+    pdf = _inline_named_cs_pdf(Array(CALRGB_CS), define=False)
+    iimage = _first_inline_image(pdf)
+    assert iimage is not None
+    with pytest.raises(NotImplementedError):
+        iimage.colorspace  # noqa: B018
+
+
 def test_bits_per_component_missing(congress):
     cong_im, _ = congress
     del cong_im.stream_dict['/BitsPerComponent']
@@ -642,24 +713,44 @@ def test_extract_filepath(congress, outdir):
     assert (outdir / 'image.jpg').exists()
 
 
-def test_extract_direct_fails_nondefault_colortransform(congress):
+def test_rgb_jpeg_nondefault_colortransform_transcodes(congress):
+    # A non-default /ColorTransform means the stored JPEG cannot be copied out as
+    # a standalone .jpg (the codec parameters would be lost), but pikepdf still
+    # decodes it via Pillow -- which honours the JPEG's own markers -- and
+    # transcodes it to PNG rather than failing.
     xobj, _pdf = congress
 
     xobj.DecodeParms = Dictionary(
-        ColorTransform=42  # Non standard (or allowed in the spec)
+        ColorTransform=0  # Non-default for a 3-component (RGB) JPEG
     )
     pim = PdfImage(xobj)
 
-    bio = BytesIO()
-    assert pim._extract_direct(stream=bio) is None
-    with pytest.raises(UnsupportedImageTypeError):
-        pim.extract_to(stream=bio)
+    assert pim._extract_direct(stream=BytesIO()) is None
+    im = pim.as_pil_image()
+    assert im.mode == 'RGB'
+    assert im.size == (pim.width, pim.height)
 
-    xobj.ColorSpace = Name.DeviceCMYK
+    bio = BytesIO()
+    assert pim.extract_to(stream=bio) == '.png'
+
+
+def test_cmyk_jpeg_nondefault_colortransform_transcodes(first_image_in):
+    # A YCCK-style CMYK JPEG (ColorTransform 1) cannot be copied out directly, but
+    # it transcodes via Pillow to a CMYK image saved as TIFF.
+    xobj, _pdf = first_image_in('cmyk-jpeg.pdf')
+
+    xobj.DecodeParms = Dictionary(
+        ColorTransform=1  # Non-default for a 4-component (CMYK) JPEG
+    )
     pim = PdfImage(xobj)
-    assert pim._extract_direct(stream=bio) is None
-    with pytest.raises(UnsupportedImageTypeError):
-        pim.extract_to(stream=bio)
+
+    assert pim._extract_direct(stream=BytesIO()) is None
+    im = pim.as_pil_image()
+    assert im.mode == 'CMYK'
+    assert im.size == (pim.width, pim.height)
+
+    bio = BytesIO()
+    assert pim.extract_to(stream=bio) == '.tiff'
 
 
 def test_icc_use(first_image_in):
@@ -719,6 +810,59 @@ def test_stacked_compression_no_orphaned_objects(first_image_in):
         pim.as_pil_image().close()
 
     assert len(pdf.objects) == initial_count
+
+
+def test_ascii85_flate_dct_extracts_jpg(congress):
+    # Any number of generalized/specialized filters wrapping a single terminal
+    # codec must be peeled away, leaving the JPEG to extract directly.
+    xobj, _pdf = congress
+    raw_jpeg = xobj.read_raw_bytes()
+    import base64
+
+    a85 = base64.a85encode(zlib.compress(raw_jpeg)) + b'~>'
+    xobj.write(
+        a85, filter=Array([Name.ASCII85Decode, Name.FlateDecode, Name.DCTDecode])
+    )
+
+    pim = PdfImage(xobj)
+    data, filters = pim._remove_simple_filters()
+    assert filters == ['/DCTDecode']
+    assert data == raw_jpeg
+    bio = BytesIO()
+    assert pim.extract_to(stream=bio) == '.jpg'
+
+
+def test_flate_wrapped_ccitt_extract(sandwich):
+    # A simple filter wrapping a CCITT codec must peel correctly *and* the CCITT
+    # header must be built from the CCITT filter's own /DecodeParms, not from the
+    # (now leading) simple filter's parms.
+    xobj, _pdf = sandwich
+    baseline = PdfImage(xobj).as_pil_image().convert('L').tobytes()
+
+    raw_ccitt = xobj.read_raw_bytes()
+    ccitt_parms = xobj.DecodeParms
+    xobj.write(
+        zlib.compress(raw_ccitt),
+        filter=Array([Name.FlateDecode, Name.CCITTFaxDecode]),
+        decode_parms=Array([Dictionary(), ccitt_parms]),
+    )
+
+    pim = PdfImage(xobj)
+    assert pim.filters == ['/FlateDecode', '/CCITTFaxDecode']
+    data, filters = pim._remove_simple_filters()
+    assert filters == ['/CCITTFaxDecode']
+    assert data == raw_ccitt
+    assert PdfImage(xobj).as_pil_image().convert('L').tobytes() == baseline
+
+
+def test_two_terminal_codecs_unsupported(congress):
+    # Two terminal image codecs in one chain cannot be decoded by any reader;
+    # pikepdf rejects this with a clear, consistent exception type.
+    xobj, _pdf = congress
+    xobj.Filter = Array([Name.DCTDecode, Name.CCITTFaxDecode])
+    pim = PdfImage(xobj)
+    with pytest.raises(UnsupportedImageTypeError):
+        pim._remove_simple_filters()
 
 
 @pytest.mark.parametrize(
@@ -1009,6 +1153,59 @@ def test_decode_array_length_mismatch_ignored():
         )
     )
     assert list(pim.as_pil_image().convert('L').tobytes()) == [10, 200]
+
+
+def _make_iccbased_xobject(pdf, *, n, decode=None):
+    """Build a minimal ICCBased image XObject with an N-channel profile stream."""
+    icc_stream = pdf.make_stream(b'\x00' * 16)
+    icc_stream.N = n
+    imobj = Stream(
+        pdf,
+        b'\x00' * n,
+        BitsPerComponent=8,
+        ColorSpace=Array([Name.ICCBased, icc_stream]),
+        Width=1,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    if decode is not None:
+        imobj.Decode = Array(decode)
+    return imobj
+
+
+def test_indexed_default_decode_array():
+    # The default /Decode for an Indexed colour space maps stored samples across
+    # the index range [0, 2**bpc - 1], not across the base colour space's range.
+    pdf = Pdf.new()
+    palette = bytes(range(6))  # two RGB palette entries
+    imobj = Stream(
+        pdf,
+        b'\x00\x01',
+        BitsPerComponent=8,
+        ColorSpace=Array([Name.Indexed, Name.DeviceRGB, 1, palette]),
+        Width=2,
+        Height=1,
+        Type=Name.XObject,
+        Subtype=Name.Image,
+    )
+    pim = PdfImage(imobj)
+    assert pim.indexed
+    assert pim._decode_array == (0.0, 255.0)
+
+
+def test_iccbased_cmyk_default_decode_array():
+    # A 4-channel (CMYK) ICCBased image has an 8-element identity default /Decode.
+    pdf = Pdf.new()
+    pim = PdfImage(_make_iccbased_xobject(pdf, n=4))
+    assert pim._decode_array == (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+
+
+def test_iccbased_cmyk_explicit_decode_array():
+    # An explicit 8-element /Decode on a CMYK ICCBased image is honoured verbatim.
+    pdf = Pdf.new()
+    pim = PdfImage(_make_iccbased_xobject(pdf, n=4, decode=[1, 0, 1, 0, 1, 0, 1, 0]))
+    assert pim._decode_array == (1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0)
 
 
 @pytest.mark.skipif(

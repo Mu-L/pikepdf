@@ -43,6 +43,18 @@ the architecture notes on thread safety.
 -   Added support for 16-bit-per-component images. 16-bit grayscale is extracted
     losslessly as Pillow ``I;16``; 16-bit RGB and CMYK are reduced to 8-bit (with
     a warning) because Pillow has no higher-bit-depth raw mode for them.
+-   Extended colour-space handling to several cases that previously raised
+    ``NotImplementedError``: ICCBased CMYK images and indexed images now produce
+    the correct default ``/Decode`` array, and inline images that name their
+    colour space now resolve it from the in-scope ``/Resources`` when obtained via
+    {func}`pikepdf.parse_content_stream`.
+-   JPEG (``/DCTDecode``) images with a non-default ``/ColorTransform`` -- a YCCK
+    CMYK or a non-YCbCr RGB JPEG -- are now decoded via Pillow (which honours the
+    JPEG's own markers) and transcoded, instead of failing to extract.
+-   Filter chains that wrap a single terminal image codec (``/DCTDecode``,
+    ``/CCITTFaxDecode``, ``/JPXDecode``, ``/JBIG2Decode``) in any number of
+    generalized/specialized filters (Flate, LZW, ASCII85/Hex, RunLength) are now
+    peeled and extracted seamlessly.
 -   Added {attr}`pikepdf.PdfImage.MAX_IMAGE_PIXELS`, a settable class-level limit
     on the number of pixels pikepdf will decode from a single image. Until set,
     it defaults to ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- a floor
@@ -61,6 +73,10 @@ the architecture notes on thread safety.
     ``/Matte`` entry on a soft mask is not undone (a warning is emitted). When an
     image has both an ``/SMask`` and a ``/Mask``, the soft mask takes precedence.
     Colour-key masking is applied only to 8-bit ``L``/``RGB``/``CMYK`` images.
+-   A filter chain containing two or more terminal image codecs (for example
+    ``[/DCTDecode /CCITTFaxDecode]``) cannot be decoded by any reader and now
+    raises {class}`~pikepdf.exceptions.UnsupportedImageTypeError` rather than
+    ``NotImplementedError``.
 
 ### Security
 
@@ -78,6 +94,12 @@ the architecture notes on thread safety.
 
 ### Fixed
 
+- A CCITT fax image preceded by a stripped simple filter (e.g.
+  `[/FlateDecode /CCITTFaxDecode]`) now builds its TIFF header from the
+  `/CCITTFaxDecode` filter's own `/DecodeParms` rather than the leading filter's,
+  which previously produced a corrupt extraction.
+- Corrected the documentation of {class}`pikepdf.StreamDecodeLevel`: the
+  `specialized` and `all` levels were each described with the other's behavior.
 - Fixed a crash (`SIGABRT` via `std::terminate`) that could occur when a
   file-backed {class}`pikepdf.Pdf` was deallocated while a Python exception was
   already propagating -- for example when `pikepdf.open(filename)` appears as a

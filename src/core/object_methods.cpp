@@ -715,7 +715,7 @@ void init_object_methods(py::class_<QPDFObjectHandle> &object)
             py::arg("description") = "")
         .def("_parse_page_contents_grouped",
             [](QPDFObjectHandle &h, std::string const &whitelist) {
-                OperandGrouper og(whitelist);
+                OperandGrouper og(whitelist, h.getKey("/Resources"));
                 h.parsePageContents(&og);
                 return og.getInstructions();
             })
@@ -725,7 +725,12 @@ void init_object_methods(py::class_<QPDFObjectHandle> &object)
             "``pikepdf.parse_content_stream``.")
         .def_static("_parse_stream_grouped",
             [](QPDFObjectHandle &h, std::string const &whitelist) {
-                OperandGrouper og(whitelist);
+                // A content stream (e.g. a Form XObject) may carry its own
+                // /Resources, used to resolve inline images' named colour spaces.
+                QPDFObjectHandle resources;
+                if (h.isStream())
+                    resources = h.getDict().getKey("/Resources");
+                OperandGrouper og(whitelist, resources);
                 QPDFObjectHandle::parseContentStream(h, &og);
                 // LCOV_EXCL_START - warning path depends on qpdf internals
                 if (!og.getWarning().empty()) {

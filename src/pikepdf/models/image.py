@@ -48,6 +48,14 @@ GrayDecodeArray = tuple[float, float]
 CMYKDecodeArray = tuple[float, float, float, float, float, float, float, float]
 DecodeArray = RGBDecodeArray | GrayDecodeArray | CMYKDecodeArray
 
+# Filters that are *terminal* image codecs: each is a complete, irreducible
+# compression scheme that produces final image samples and cannot be composed
+# with another terminal codec. qpdf cannot strip these as generalized/
+# specialized filters, so they are handled by pikepdf/Pillow at extraction time.
+TERMINAL_FILTERS = frozenset(
+    {'/DCTDecode', '/JPXDecode', '/JBIG2Decode', '/CCITTFaxDecode'}
+)
+
 
 class UnsupportedImageTypeError(Exception):
     """This image is formatted in a way pikepdf does not supported."""
@@ -279,6 +287,13 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         if decode and len(decode) in (2, 6, 8):
             return cast(DecodeArray, tuple(float(value) for value in decode))
 
+        # Indexed images have a single component (the palette index); their
+        # default /Decode maps stored samples across the index range, not the
+        # base colour space's range (ISO 32000-2 Table 88). Check this before the
+        # colorspace branches, since self.colorspace reports the *base* space.
+        if self.indexed:
+            return (0.0, float((1 << self.bits_per_component) - 1))
+
         if self.colorspace in ('/DeviceGray', '/CalGray'):
             return (0.0, 1.0)
         if self.colorspace in ('/DeviceRGB', '/CalRGB'):
@@ -289,10 +304,17 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
             amin, amax, bmin, bmax = self._lab_range()
             return (0.0, 100.0, amin, amax, bmin, bmax)
         if self.colorspace == '/ICCBased':
-            if self._approx_mode_from_icc() == 'L':
-                return (0.0, 1.0)
-            if self._approx_mode_from_icc() == 'RGB':
-                return (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+            # The default /Decode is the identity for every channel, so its
+            # length is the only thing that matters: it equals the profile's
+            # component count /N (1=gray, 3=RGB/Lab, 4=CMYK). Read /N directly
+            # rather than opening the profile.
+            try:
+                iccstream = cast(Dictionary, self._colorspaces[1])
+                n = int(iccstream['/N'])
+            except (TypeError, KeyError, ValueError, IndexError):
+                n = 0
+            if n in (1, 3, 4):
+                return cast(DecodeArray, (0.0, 1.0) * n)
         if self.image_mask:
             return (0.0, 1.0)  # Default for image masks; per RM 8.9.6.2
 
@@ -676,32 +698,36 @@ class PdfImage(PdfImageBase):
             return None
 
     def _remove_simple_filters(self):
-        """Remove simple lossless compression where it appears."""
-        COMPLEX_FILTERS = {
-            '/DCTDecode',
-            '/JPXDecode',
-            '/JBIG2Decode',
-            '/CCITTFaxDecode',
-        }
-        indices = [n for n, filt in enumerate(self.filters) if filt in COMPLEX_FILTERS]
+        """Strip generalized/specialized filters, leaving the terminal codec.
+
+        Returns ``(data, remaining_filters)``. Any number of simple
+        (qpdf-decodable) filters wrapping a single terminal codec are peeled
+        away; if there is no terminal codec, every filter is decoded. Two or
+        more terminal codecs in one chain cannot be decoded by any reader.
+        """
+        indices = [n for n, filt in enumerate(self.filters) if filt in TERMINAL_FILTERS]
         if len(indices) > 1:
-            raise NotImplementedError(
-                f"Object {self.obj.objgen} has compound complex filters: "
-                f"{self.filters}. We cannot decompress this."
+            raise UnsupportedImageTypeError(
+                f"Object {self.obj.objgen} has two or more terminal image codecs "
+                f"in one filter chain: {self.filters}. Such a chain cannot be "
+                "decoded, because each codec produces final image samples."
             )
         if len(indices) == 0:
-            # No complex filter indices, so all filters are simple - remove them all
+            # No terminal codec, so every filter is simple - decode them all
             return self.obj.read_bytes(StreamDecodeLevel.specialized), []
 
         n = indices[0]
         if n == 0:
-            # The only filter is complex, so return
+            # The only filter is the terminal codec, so return it untouched
             return self.obj.read_raw_bytes(), self.filters
 
-        # Put copy in a temporary PDF to ensure we don't permanently modify self
+        # Put a copy in a temporary PDF so we don't permanently modify self.
+        # qpdf tolerates a /DecodeParms array that is absent or shorter than
+        # /Filter (it treats the missing entries as null), so a plain slice is
+        # safe; explicit empty <<>> entries, by contrast, make it unfilterable.
         with Pdf.new() as tmp_pdf:
             obj_copy = tmp_pdf.copy_foreign(self.obj)
-            obj_copy.Filter = Array([Name(f) for f in self.filters[:n]])
+            obj_copy.Filter = Array([Name(str(filt)) for filt in self.filters[:n]])
             obj_copy.DecodeParms = Array(self.decode_parms[:n])
             return obj_copy.read_bytes(StreamDecodeLevel.specialized), self.filters[n:]
 
@@ -895,6 +921,25 @@ class PdfImage(PdfImageBase):
     def _extract_transcoded_mask(self) -> Image.Image:
         return self._extract_transcoded_1bit()
 
+    def _extract_transcoded_jpeg(self) -> Image.Image:
+        """Decode a DCTDecode (JPEG) image with Pillow.
+
+        Used when the JPEG cannot be copied out as a standalone file -- for
+        example a non-default /ColorTransform (a YCCK CMYK or a non-YCbCr RGB
+        JPEG) -- so it must be decoded to pixels. Pillow's decoder honours the
+        JPEG's own markers (the Adobe APP14 transform that signals YCbCr/YCCK and
+        inverted CMYK), which the raw PDF parameters cannot convey.
+        """
+        from PIL import Image
+
+        data, filters = self._remove_simple_filters()
+        if filters != ['/DCTDecode']:
+            raise UnsupportedImageTypeError(repr(self) + ", " + repr(self.obj))
+        with _pillow_pixel_limit(None):
+            im = Image.open(BytesIO(data))
+            im.load()
+        return im
+
     def _apply_decode_array(self, im: Image.Image) -> Image.Image:
         """Apply the /Decode array to a decoded image, in pixel space.
 
@@ -999,7 +1044,12 @@ class PdfImage(PdfImageBase):
         if self.mode in {'DeviceN', 'Separation'}:
             raise HifiPrintImageNotTranscodableError()
 
-        if self.colorspace == '/Lab' and not self.indexed:
+        if '/DCTDecode' in self.filters:
+            # A JPEG that declined direct extraction (e.g. a non-default
+            # /ColorTransform) is decoded by Pillow rather than read as raw
+            # samples, which qpdf cannot produce for DCTDecode at this level.
+            im = self._extract_transcoded_jpeg()
+        elif self.colorspace == '/Lab' and not self.indexed:
             im = self._extract_transcoded_lab()
         elif self.bits_per_component == 16:
             im = self._extract_transcoded_16bit()
@@ -1331,19 +1381,30 @@ class PdfImage(PdfImageBase):
         # https://stackoverflow.com/questions/2641770/
         # https://www.itu.int/itudoc/itu-t/com16/tiff-fx/docs/tiff6.pdf
 
-        if not self.decode_parms:
+        # Use the /DecodeParms that belong to the /CCITTFaxDecode filter itself.
+        # When simple filters are stripped from in front of it, CCITTFaxDecode is
+        # no longer at index 0, so its parameters are not decode_parms[0].
+        ccitt_parms = next(
+            (
+                parms
+                for filt, parms in self.filter_decodeparms
+                if filt == '/CCITTFaxDecode'
+            ),
+            None,
+        )
+        if not ccitt_parms:
             raise ValueError("/CCITTFaxDecode without /DecodeParms")
 
         expected_defaults = [
             ("/EncodedByteAlign", False),
         ]
         for name, val in expected_defaults:
-            if self.decode_parms[0].get(name, val) != val:
+            if ccitt_parms.get(name, val) != val:
                 raise UnsupportedImageTypeError(
                     f"/CCITTFaxDecode with decode parameter {name} not equal {val}"
                 )
 
-        k = self.decode_parms[0].get("/K", 0)
+        k = int(ccitt_parms.get("/K", 0))
         t4_options = None
         if k < 0:
             ccitt_group = 4  # Group 4
@@ -1352,7 +1413,7 @@ class PdfImage(PdfImageBase):
             t4_options = 1
         else:
             ccitt_group = 3  # Group 3 1-D
-        black_is_one = self.decode_parms[0].get("/BlackIs1", False)
+        black_is_one = ccitt_parms.get("/BlackIs1", False)
         decode = self._decode_array
         # PDF spec says:
         # BlackIs1: A flag indicating whether 1 bits shall be interpreted as black
@@ -1506,13 +1567,24 @@ class PdfInlineImage(PdfImageBase):
 
     _data: Object
     _image_object: tuple[Object, ...]
+    _resources: Object | None
 
-    def __init__(self, *, image_data: Object, image_object: tuple):
+    def __init__(
+        self,
+        *,
+        image_data: Object,
+        image_object: tuple,
+        resources: Object | None = None,
+    ):
         """Construct wrapper for inline image.
 
         Args:
             image_data: data stream for image, extracted from content stream
             image_object: the metadata for image, also from content stream
+            resources: the /Resources dictionary in scope where the inline image
+                appears, used to resolve a named colour space referenced by the
+                image's /CS. Supplied automatically by
+                :func:`pikepdf.parse_content_stream`; ``None`` when unavailable.
         """
         # Convert the sequence of pikepdf.Object from the content stream into
         # a dictionary object by unparsing it (to bytes), eliminating inline
@@ -1521,6 +1593,7 @@ class PdfInlineImage(PdfImageBase):
 
         self._data = image_data
         self._image_object = image_object
+        self._resources = resources
 
         reparse = b' '.join(
             self._unparse_obj(obj, remap_names=self.ABBREVS) for obj in image_object
@@ -1559,6 +1632,44 @@ class PdfInlineImage(PdfImageBase):
 
     def _metadata(self, name, type_, default):
         return _metadata_from_obj(self.obj, name, type_, default)
+
+    def _resolve_named_colorspace(self, name: str) -> Object | None:
+        """Resolve a named colour space against the in-scope /Resources.
+
+        An inline image may name its colour space (e.g. ``/CS /CS0``); the name
+        is a key in the ``/ColorSpace`` subdictionary of the resources in scope
+        (ISO 32000-2 §8.9.7). Returns the colour space object, or None when there
+        are no resources or the name is not defined there.
+        """
+        if self._resources is None:
+            return None
+        try:
+            cs_resources = self._resources.get('/ColorSpace')
+            if cs_resources is None:
+                return None
+            return cs_resources.get(name)
+        except (AttributeError, TypeError):
+            return None
+
+    @property
+    def _colorspaces(self):
+        """Colorspace, resolving a named colour space from /Resources if needed.
+
+        Device-space abbreviations (/G, /RGB, /CMYK) and /I are already expanded
+        during construction; any other first entry is a name to resolve against
+        the in-scope resources, so all downstream logic sees a real colour space.
+        """
+        cs = super()._colorspaces
+        if (
+            cs
+            and isinstance(cs[0], str)
+            and cs[0] not in self.MAIN_COLORSPACES
+            and cs[0] not in ('/Indexed', '/DeviceN', '/Separation')
+        ):
+            resolved = self._resolve_named_colorspace(cs[0])
+            if resolved is not None:
+                return _array_str(resolved)
+        return cs
 
     def unparse(self) -> bytes:
         """Create the content stream bytes that reproduce this inline image."""
@@ -1606,6 +1717,11 @@ class PdfInlineImage(PdfImageBase):
         )
         tmppdf.pages[0].contents_add(self.unparse())
 
+        # If the inline image names a colour space defined in the in-scope
+        # /Resources, copy that definition into the temporary page's resources so
+        # externalization (which emits /ColorSpace <name>) can resolve it.
+        self._copy_named_colorspace_into(tmppdf)
+
         # ...externalize it,
         tmppdf.pages[0].externalize_inline_images()
         raw_img = cast(
@@ -1617,6 +1733,30 @@ class PdfInlineImage(PdfImageBase):
         img = PdfImage(raw_img)
         img._set_pdf_source(tmppdf)  # Hold tmppdf open while PdfImage exists
         return img
+
+    def _copy_named_colorspace_into(self, tmppdf: Pdf) -> None:
+        """Copy a named colour space definition into *tmppdf*'s page resources."""
+        cs = super()._colorspaces
+        if not (cs and isinstance(cs[0], str)):
+            return
+        name = cs[0]
+        if name in self.MAIN_COLORSPACES or name in (
+            '/Indexed',
+            '/DeviceN',
+            '/Separation',
+        ):
+            return
+        resolved = self._resolve_named_colorspace(name)
+        if resolved is None:
+            return
+        if resolved.is_indirect:
+            resolved = tmppdf.copy_foreign(resolved)
+        page = tmppdf.pages[0]
+        if '/Resources' not in page:
+            page.Resources = Dictionary()
+        if '/ColorSpace' not in page.Resources:
+            page.Resources.ColorSpace = Dictionary()
+        page.Resources.ColorSpace[name] = resolved
 
     def as_pil_image(
         self, apply_decode_array: bool = True, apply_mask: bool = True
