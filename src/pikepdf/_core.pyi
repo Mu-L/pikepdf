@@ -59,6 +59,10 @@ class Buffer:
 
     def __bytes__(self) -> bytes: ...
     def __len__(self) -> int: ...
+    # Implements the C-level buffer protocol; declaring __buffer__ (PEP 688) lets
+    # type checkers accept a Buffer wherever a read-only buffer is expected, e.g.
+    # BytesIO(buffer) or memoryview(buffer).
+    def __buffer__(self, flags: int, /) -> memoryview: ...
 
 class _NamePath(NamePath):
     """Path for accessing nested Dictionary/Stream values.

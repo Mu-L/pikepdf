@@ -86,9 +86,13 @@ def _ensure_list(value: list[Object] | Dictionary | Array | Object) -> list[Obje
 
 
 def _metadata_from_obj(
-    obj: Dictionary | Stream, name: str, type_: Callable[[Any], T], default: T
+    obj: Object, name: str, type_: Callable[[Any], T], default: T
 ) -> T | None:
-    """Retrieve metadata from a dictionary or stream and wrangle types."""
+    """Retrieve metadata from a dictionary or stream and wrangle types.
+
+    *obj* is the underlying image object: a Stream (image XObject), or a
+    Dictionary (inline image). Any Object with attribute access works.
+    """
     val = getattr(obj, name, default)
     try:
         return type_(val)

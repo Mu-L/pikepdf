@@ -69,9 +69,17 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
     }
     PRINT_COLORSPACES = {'/Separation', '/DeviceN'}
 
+    #: The underlying PDF object: a Stream (image XObject) or a Dictionary
+    #: (inline image). Set by each concrete subclass.
+    obj: Object
+
     @abstractmethod
-    def _metadata(self, name: str, type_: Callable[[Any], T], default: T) -> T:
-        """Get metadata for this image type."""
+    def _metadata(self, name: str, type_: Callable[[Any], T], default: Any) -> T:
+        """Get metadata for this image type.
+
+        *default* is the fallback value passed to ``getattr``; its type is
+        independent of the converted result type *T* (which comes from *type_*).
+        """
 
     @property
     def width(self) -> int:
@@ -94,12 +102,12 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         return self._metadata('BitsPerComponent', int, 0)
 
     @property
-    def _colorspaces(self):
+    def _colorspaces(self) -> list:
         """Colorspace (low-level)."""
         return self._metadata('ColorSpace', _array_str, [])
 
     @property
-    def filters(self):
+    def filters(self) -> list:
         """List of names of the filters that we applied to encode this image."""
         return self._metadata('Filter', _array_str, [])
 
@@ -109,7 +117,7 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         return _colorspace.decode_array(self)
 
     @property
-    def decode_parms(self):
+    def decode_parms(self) -> list:
         """List of the /DecodeParms, arguments to filters."""
         return self._metadata('DecodeParms', _ensure_list, [])
 
@@ -143,7 +151,7 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         """Check if the image has a defined color palette."""
         return '/Indexed' in self._colorspaces
 
-    def _colorspace_has_name(self, name):
+    def _colorspace_has_name(self, name: str) -> bool:
         return _colorspace.colorspace_has_name(self, name)
 
     @property
@@ -161,7 +169,7 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         """Size of image as (width, height)."""
         return self.width, self.height
 
-    def _approx_mode_from_icc(self):
+    def _approx_mode_from_icc(self) -> str:
         return _colorspace.approx_mode_from_icc(self)
 
     @property
@@ -174,7 +182,7 @@ class PdfImageBase(ABC, metaclass=_PdfImageMeta):
         return _colorspace.mode(self)
 
     @property
-    def filter_decodeparms(self):
+    def filter_decodeparms(self) -> list:
         """Return normalized the Filter and DecodeParms data.
 
         PDF has a lot of possible data structures concerning /Filter and
@@ -226,11 +234,10 @@ class PdfImage(PdfImageBase):
     Pillow imaging library.
     """
 
-    obj: Stream
     _icc: ImageCmsProfile | None
     _pdf_source: Pdf | None
 
-    def __new__(cls, obj: Stream):
+    def __new__(cls, obj: Stream) -> PdfImage:
         """Construct a PdfImage... or a PdfJpxImage if that is what we really are."""
         try:
             # Check if JPXDecode is called for and initialize as PdfJpxImage
@@ -242,7 +249,7 @@ class PdfImage(PdfImageBase):
             pass
         return super().__new__(PdfImage)
 
-    def __init__(self, obj: Stream):
+    def __init__(self, obj: Stream) -> None:
         """Construct a PDF image from a Image XObject inside a PDF.
 
         ``pim = PdfImage(page.Resources.XObject['/ImageNN'])``
@@ -255,20 +262,27 @@ class PdfImage(PdfImageBase):
         self.obj = obj
         self._icc = None
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, PdfImageBase):
             return NotImplemented
         return self.obj == other.obj
 
     @classmethod
-    def _from_pil_image(cls, *, pdf, page, name, image):  # pragma: no cover
+    def _from_pil_image(
+        cls,
+        *,
+        pdf: Pdf,
+        page: Object,
+        name: str | Name,
+        image: Image.Image,
+    ) -> PdfImage:  # pragma: no cover
         """Insert a PIL image into a PDF (rudimentary).
 
         Args:
-            pdf (pikepdf.Pdf): the PDF to attach the image to
-            page (pikepdf.Object): the page to attach the image to
-            name (str or pikepdf.Name): the name to set the image
-            image (PIL.Image.Image): the image to insert
+            pdf: the PDF to attach the image to
+            page: the page to attach the image to
+            name: the name to set the image
+            image: the image to insert
         """
         data = image.tobytes()
 
@@ -287,11 +301,11 @@ class PdfImage(PdfImageBase):
 
         return cls(imstream)
 
-    def _metadata(self, name, type_, default):
-        return _metadata_from_obj(self.obj, name, type_, default)
+    def _metadata(self, name: str, type_: Callable[[Any], T], default: Any) -> T:
+        return cast(T, _metadata_from_obj(self.obj, name, type_, default))
 
     @property
-    def _iccstream(self):
+    def _iccstream(self) -> Object:
         return _colorspace.iccstream(self)
 
     @property
@@ -313,7 +327,7 @@ class PdfImage(PdfImageBase):
         """
         return _colorspace.synthesize_cal_icc(self)
 
-    def _remove_simple_filters(self):
+    def _remove_simple_filters(self) -> tuple[bytes, list]:
         """Strip generalized/specialized filters, leaving the terminal codec.
 
         See :func:`pikepdf.models.image._extract.remove_simple_filters`.
@@ -558,14 +572,14 @@ class PdfImage(PdfImageBase):
             self, data, icc=icc, apply_decode_array=apply_decode_array
         )
 
-    def show(self):  # pragma: no cover
+    def show(self) -> None:  # pragma: no cover
         """Show the image however PIL wants to."""
         self.as_pil_image().show()
 
-    def _set_pdf_source(self, pdf: Pdf):
+    def _set_pdf_source(self, pdf: Pdf) -> None:
         self._pdf_source = pdf
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         try:
             mode = self.mode
         except NotImplementedError:
@@ -583,14 +597,14 @@ class PdfJpxImage(PdfImage):
     this class instead, due to the check in PdfImage.__new__.
     """
 
-    def __init__(self, obj):
+    def __init__(self, obj: Stream) -> None:
         """Initialize a JPEG 2000 image."""
         super().__init__(obj)
         # Intrinsic decoded image for colorspace/equality introspection; the
         # /Decode remap is a presentation concern and intentionally excluded.
         self._jpxpil = self.as_pil_image(apply_decode_array=False, apply_mask=False)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, PdfImageBase):
             return NotImplemented
         return (
@@ -612,7 +626,7 @@ class PdfJpxImage(PdfImage):
         return super()._extract_transcoded()
 
     @property
-    def _colorspaces(self):
+    def _colorspaces(self) -> list:
         """Return the effective colorspace of a JPEG 2000 image.
 
         If the ColorSpace dictionary is present, the colorspace embedded in the
@@ -646,7 +660,7 @@ class PdfJpxImage(PdfImage):
         # insane.
         return False
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f'<pikepdf.PdfJpxImage JPEG2000 image mode={self.mode} '
             f'size={self.width}x{self.height} at {hex(id(self))}>'
@@ -717,7 +731,7 @@ class PdfInlineImage(PdfImageBase):
             raise PdfError("parsing inline " + reparse.decode('unicode_escape')) from e
         self.obj = reparsed_obj
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, PdfImageBase):
             return NotImplemented
         return (
@@ -730,7 +744,9 @@ class PdfInlineImage(PdfImageBase):
         )
 
     @classmethod
-    def _unparse_obj(cls, obj, remap_names):
+    def _unparse_obj(
+        cls, obj: Object | bool | int | Decimal | float, remap_names: dict[bytes, bytes]
+    ) -> bytes:
         if isinstance(obj, Object):
             if isinstance(obj, Name):
                 name = obj.unparse(resolved=True)
@@ -743,8 +759,8 @@ class PdfInlineImage(PdfImageBase):
             return str(obj).encode('ascii')
         raise NotImplementedError(repr(obj))
 
-    def _metadata(self, name, type_, default):
-        return _metadata_from_obj(self.obj, name, type_, default)
+    def _metadata(self, name: str, type_: Callable[[Any], T], default: Any) -> T:
+        return cast(T, _metadata_from_obj(self.obj, name, type_, default))
 
     def _resolve_named_colorspace(self, name: str) -> Object | None:
         """Resolve a named colour space against the in-scope /Resources.
@@ -765,7 +781,7 @@ class PdfInlineImage(PdfImageBase):
             return None
 
     @property
-    def _colorspaces(self):
+    def _colorspaces(self) -> list:
         """Colorspace, resolving a named colour space from /Resources if needed.
 
         Device-space abbreviations (/G, /RGB, /CMYK) and /I are already expanded
@@ -805,13 +821,13 @@ class PdfInlineImage(PdfImageBase):
         return b''.join(inline_image_tokens())
 
     @property
-    def icc(self):  # pragma: no cover
+    def icc(self) -> ImageCmsProfile | None:  # pragma: no cover
         """Raise an exception since ICC profiles are not supported on inline images."""
         raise InvalidPdfImageError(
             "Inline images with ICC profiles are not supported in the PDF specification"
         )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         try:
             mode = self.mode
         except NotImplementedError:
@@ -886,7 +902,7 @@ class PdfInlineImage(PdfImageBase):
         fileprefix: str = '',
         apply_decode_array: bool = True,
         apply_mask: bool = True,
-    ):
+    ) -> str:
         """Extract the inline image directly to a usable image file.
 
         See:
@@ -899,12 +915,12 @@ class PdfInlineImage(PdfImageBase):
             apply_mask=apply_mask,
         )
 
-    def read_bytes(self):
+    def read_bytes(self) -> bytes:
         """Return decompressed image bytes."""
         # qpdf does not have an API to return this directly, so convert it.
         return self._convert_to_pdfimage().read_bytes()
 
-    def get_stream_buffer(self):
+    def get_stream_buffer(self) -> Buffer:
         """Return decompressed stream buffer."""
         # qpdf does not have an API to return this directly, so convert it.
         return self._convert_to_pdfimage().get_stream_buffer()
