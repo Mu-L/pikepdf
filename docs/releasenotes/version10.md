@@ -14,7 +14,69 @@ free-threaded use required building from source. As always, coordinating
 concurrent modification of the same object across threads requires a lock -- see
 the architecture notes on thread safety.
 
-## v10.9.2
+## v10.10.0
+
+### Behavior change
+
+-   {meth}`pikepdf.PdfImage.as_pil_image` and {meth}`pikepdf.PdfImage.extract_to`
+    now apply an image's soft mask (``/SMask``) or explicit/colour-key mask
+    (``/Mask``) by default, returning an image with an alpha channel (``LA`` or
+    ``RGBA``) and writing a transparency-capable format (``.png``). Previously
+    the mask was silently ignored and the opaque base image was returned. Images
+    without a mask are unaffected. Pass ``apply_mask=False`` to recover the old
+    behavior and obtain only the opaque base image.
+
+### New features
+
+-   Image masking is now honored when extracting images. ``/SMask`` soft masks,
+    ``/Mask`` stencil (explicit) masks, and ``/Mask`` colour-key masks are
+    composited into an alpha channel. Soft-mask images whose resolution differs
+    from the base image are resampled to match (ISO 32000-2 §8.9.6).
+-   Added support for ``/CalRGB``, ``/CalGray`` and ``/CalCMYK`` images, which
+    previously raised ``NotImplementedError``. The samples are decoded as their
+    device equivalents, and for CalRGB/CalGray an ICC profile synthesized from
+    the colour space's ``WhitePoint``/``Gamma``/``Matrix`` is attached to the
+    extracted image so the calibration is preserved for colour-managed consumers.
+-   Added support for the ``/Lab`` colour space, extracted as a Pillow ``LAB``
+    image (saved as TIFF) with the PDF ``L*``/``a*``/``b*`` ranges remapped to
+    Pillow's conventions.
+-   Added support for 16-bit-per-component images. 16-bit grayscale is extracted
+    losslessly as Pillow ``I;16``; 16-bit RGB and CMYK are reduced to 8-bit (with
+    a warning) because Pillow has no higher-bit-depth raw mode for them.
+-   Extended colour-space handling to several cases that previously raised
+    ``NotImplementedError``: ICCBased CMYK images and indexed images now produce
+    the correct default ``/Decode`` array, and inline images that name their
+    colour space now resolve it from the in-scope ``/Resources`` when obtained via
+    {func}`pikepdf.parse_content_stream`.
+-   JPEG (``/DCTDecode``) images with a non-default ``/ColorTransform`` -- a YCCK
+    CMYK or a non-YCbCr RGB JPEG -- are now decoded via Pillow (which honours the
+    JPEG's own markers) and transcoded, instead of failing to extract.
+-   Filter chains that wrap a single terminal image codec (``/DCTDecode``,
+    ``/CCITTFaxDecode``, ``/JPXDecode``, ``/JBIG2Decode``) in any number of
+    generalized/specialized filters (Flate, LZW, ASCII85/Hex, RunLength) are now
+    peeled and extracted seamlessly.
+-   Added {attr}`pikepdf.PdfImage.MAX_IMAGE_PIXELS`, a settable class-level limit
+    on the number of pixels pikepdf will decode from a single image. Until set,
+    it defaults to ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- a floor
+    suited to high-DPI scanned PDFs -- and tracks Pillow's setting; once assigned
+    it becomes independent of Pillow. Set it to ``None`` to disable the check.
+-   {class}`pikepdf.Array` now implements the standard Python ``list`` interface:
+    slicing (including ``del`` on slices and slice assignment), and the
+    ``clear()``, ``count()``, ``index()``, ``insert()``, ``pop()``, ``remove()``,
+    and ``reverse()`` methods.
+
+### Limitations
+
+-   ``/SMaskInData`` (alpha encoded inside a JPEG 2000 stream) is applied only
+    when Pillow's JPEG 2000 decoder surfaces the alpha channel itself; a
+    pre-multiplied (``SMaskInData 2``) result is not un-premultiplied. A
+    ``/Matte`` entry on a soft mask is not undone (a warning is emitted). When an
+    image has both an ``/SMask`` and a ``/Mask``, the soft mask takes precedence.
+    Colour-key masking is applied only to 8-bit ``L``/``RGB``/``CMYK`` images.
+-   A filter chain containing two or more terminal image codecs (for example
+    ``[/DCTDecode /CCITTFaxDecode]``) cannot be decoded by any reader and now
+    raises {class}`~pikepdf.exceptions.UnsupportedImageTypeError` rather than
+    ``NotImplementedError``.
 
 ### Security
 
@@ -30,23 +92,14 @@ the architecture notes on thread safety.
     {exc}`pikepdf.DecompressionBombWarning` (both subclass Pillow's equivalents).
     (#733)
 
-### New features
-
--   Added {attr}`pikepdf.PdfImage.MAX_IMAGE_PIXELS`, a settable class-level limit
-    on the number of pixels pikepdf will decode from a single image. Until set,
-    it defaults to ``max(500_000_000, PIL.Image.MAX_IMAGE_PIXELS)`` -- a floor
-    suited to high-DPI scanned PDFs -- and tracks Pillow's setting; once assigned
-    it becomes independent of Pillow. Set it to ``None`` to disable the check.
-
--   {class}`pikepdf.Array` now implements the standard Python ``list`` interface:
-    slicing (including ``del`` on slices and slice assignment), and the
-    ``clear()``, ``count()``, ``index()``, ``insert()``, ``pop()``, ``remove()``,
-    and ``reverse()`` methods.
-
-## v10.9.1
-
 ### Fixed
 
+- A CCITT fax image preceded by a stripped simple filter (e.g.
+  `[/FlateDecode /CCITTFaxDecode]`) now builds its TIFF header from the
+  `/CCITTFaxDecode` filter's own `/DecodeParms` rather than the leading filter's,
+  which previously produced a corrupt extraction.
+- Corrected the documentation of {class}`pikepdf.StreamDecodeLevel`: the
+  `specialized` and `all` levels were each described with the other's behavior.
 - Fixed a crash (`SIGABRT` via `std::terminate`) that could occur when a
   file-backed {class}`pikepdf.Pdf` was deallocated while a Python exception was
   already propagating -- for example when `pikepdf.open(filename)` appears as a

@@ -224,6 +224,64 @@ The takeaway: an extracted image's bytes reflect a *choice* about how much
 interpretation to apply. The default reproduces the presentation; pass
 `apply_decode_array=False` only when you specifically want the stored data.
 
+## Data first, rendering second
+
+That choice reflects pikepdf's general philosophy: hand you image *data* with the
+least interpretation necessary, not a rendered picture. Wherever it can,
+{meth}`~pikepdf.PdfImage.extract_to` copies the stored, already-compressed stream
+out verbatim -- a stored JPEG becomes a `.jpg`, a CCITT fax becomes a `.tif`, a
+JPEG 2000 codestream becomes a `.jp2` -- so nothing is recompressed, no quality
+is lost, and the codec's own colour semantics are preserved. This is a lossless,
+transcode-free "pdf2img".
+
+pikepdf is not a renderer: it does not composite transparency groups, rasterize
+vector drawing, or resolve every colour space to screen RGB. When you want
+exactly what a viewer displays, use one of the renderers listed on the
+{doc}`home page </index>`.
+
+### When pikepdf must transcode
+
+Some images cannot be copied out as a standalone file and must be decoded to
+pixels and re-encoded (as PNG or TIFF). Transcoding a lossy format re-encodes it,
+and in every case it gives up the verbatim-bytes guarantee. pikepdf transcodes
+when:
+
+- a non-identity `/Decode` array must be applied to a JPEG/JPEG 2000 (the codec
+  is decoded so the remap can be baked into the output);
+- a soft mask (`/SMask`) or explicit/colour-key `/Mask` is composited into an
+  alpha channel, which needs a transparency-capable container (PNG);
+- a JPEG declares a non-default `/ColorTransform` (a YCCK CMYK or non-YCbCr RGB
+  JPEG) and so cannot be written as a plain `.jpg`; Pillow decodes it, honouring
+  the JPEG's own markers;
+- a `/Lab` image is mapped into Pillow's `LAB` representation;
+- a 16-bit RGB or CMYK image is reduced to 8 bits (Pillow has no 48/64-bit mode;
+  16-bit grayscale is preserved losslessly);
+- simple filters (Flate, LZW, ASCII85/Hex, RunLength) wrap a terminal image
+  codec -- the simple filters are stripped, leaving the codec to extract.
+
+### Features that are not available
+
+A few things cannot be produced at all, by design or by the nature of the data:
+
+- **Two terminal image codecs in one filter chain** (for example
+  `[/DCTDecode /CCITTFaxDecode]`). Each terminal codec produces final image
+  samples, so they cannot be stacked; such a chain cannot be decoded by any
+  reader and raises
+  {class}`~pikepdf.exceptions.UnsupportedImageTypeError`.
+- **`/Separation` and `/DeviceN`** (and other high-fidelity printing) colour
+  spaces are not transcoded; extracting one raises
+  {class}`~pikepdf.exceptions.HifiPrintImageNotTranscodableError`. These describe
+  ink mixtures with no faithful RGB representation absent the document's
+  output-intent profile.
+- **Calibrated and `/Lab` colour spaces** are decoded as their device
+  equivalents. For `/CalRGB` and `/CalGray`, pikepdf synthesizes an ICC profile
+  from the calibration parameters and attaches it to the extracted image, so the
+  colour intent survives for consumers that honour embedded profiles.
+- **Inline image named colour spaces** resolve only when the image is obtained
+  through {func}`pikepdf.parse_content_stream` on the page (or form XObject)
+  whose `/Resources` define the name; a bare {class}`~pikepdf.PdfInlineImage`
+  constructed without that context cannot resolve a named space.
+
 ## What looks like one image may be many
 
 It is tempting to assume that one thing you see on a page corresponds to one

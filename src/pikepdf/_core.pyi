@@ -59,6 +59,10 @@ class Buffer:
 
     def __bytes__(self) -> bytes: ...
     def __len__(self) -> int: ...
+    # Implements the C-level buffer protocol; declaring __buffer__ (PEP 688) lets
+    # type checkers accept a Buffer wherever a read-only buffer is expected, e.g.
+    # BytesIO(buffer) or memoryview(buffer).
+    def __buffer__(self, flags: int, /) -> memoryview: ...
 
 class _NamePath(NamePath):
     """Path for accessing nested Dictionary/Stream values.
@@ -363,7 +367,12 @@ class StreamDecodeLevel(Enum):
         FlateDecode and ``compress_streams=True``, the original
         compressed data will be preserved."""
     specialized: ...
-    """        In addition to generalized and non-lossy
+    """        In addition to uncompressing the generalized
+        compression formats, supported non-lossy specialized
+        compression will also be decoded. At present, this includes the
+        RunLengthDecode filter."""
+    all: ...
+    """In addition to generalized and non-lossy
         specialized filters, supported lossy compression filters will
         be applied. At present, this includes DCTDecode (JPEG)
         compression. Note that compressing the resulting data with
@@ -371,11 +380,6 @@ class StreamDecodeLevel(Enum):
         compression and decompression cycles. This is mostly useful for
         (low-level) retrieving image data; see :class:`pikepdf.PdfImage` for
         the preferred method."""
-    all: ...
-    """In addition to uncompressing the
-        generalized compression formats, supported non-lossy
-        compression will also be be decoded. At present, this includes
-        the RunLengthDecode filter."""
 
 class JSONStreamData(Enum):
     """How stream data is represented when writing a PDF as qpdf JSON.
