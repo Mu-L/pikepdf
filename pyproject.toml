@@ -229,9 +229,10 @@ quote-style = "preserve"
 
 [dependency-groups]
 dev = [
+  "clang-format==22.1.5",
   "cyclopts",
   "mypy",
-  "pre-commit",
+  "prek",
   "pygithub",
   "ruff>=0.12.9",
   "setuptools>=80.9.0",

@@ -72,15 +72,19 @@ uv run ruff check --fix src tests
 uv run python -m mypy src
 
 # C++: format (uses .clang-format)
-clang-format -i src/core/*.cpp src/core/*.h
+uv run clang-format -i src/core/*.cpp src/core/*.h
 ```
 
-A pre-commit configuration is included. Install the hooks so these checks run
+A [prek](https://prek.j178.dev) configuration (`prek.toml`) is included — it
+runs the exact commands above (plus a few generic file checks) through the
+project's own pinned tool versions. Install the hooks so these checks run
 automatically on each commit:
 
 ```bash
-uv run pre-commit install
+uv run prek install
 ```
+
+Run everything manually with `uv run prek run --all-files`.
 
 ## Architecture notes
 
