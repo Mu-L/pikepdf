@@ -18,7 +18,7 @@ sdist.exclude = ["qpdf"]
 
 [project]
 name = "pikepdf"
-version = "10.13.0.post1"
+version = "10.14.0"
 description = "Read, write, repair, and transform PDFs in Python, powered by qpdf"
 readme = "README.md"
 requires-python = ">=3.11"
